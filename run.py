@@ -69,13 +69,6 @@ def setup_backend():
     print("Installing/Updating Backend Dependencies...")
     subprocess.run([python_exec, "-m", "pip", "install", "-r", "requirements.txt"], cwd=backend_dir, check=True)
 
-    # 4. Run Migrations
-    print("Applying Database Migrations...")
-    try:
-        subprocess.run([alembic_exec, "upgrade", "head"], cwd=backend_dir, check=True)
-    except Exception as e:
-        print(f"Warning: Database migration failed. Is your database running? Error: {e}")
-        
     return python_exec
 
 def setup_frontend():
