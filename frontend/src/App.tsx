@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect } from 'react'
+import { PieChart, Pie, Cell, Tooltip, ResponsiveContainer, LineChart, Line, XAxis, YAxis, CartesianGrid, Legend } from 'recharts'
 import './App.css'
 
 interface VideoMetadata {
@@ -40,9 +41,12 @@ function App() {
   const [loading, setLoading] = useState(false)
   const [asking, setAsking] = useState(false)
   
-  const [activeTab, setActiveTab] = useState<'chat' | 'comments' | 'logs'>('chat')
+  const [activeTab, setActiveTab] = useState<'chat' | 'comments' | 'analytics' | 'logs'>('chat')
   const [logs, setLogs] = useState<LogEntry[]>([])
   const [rawComments, setRawComments] = useState<RawComment[]>([])
+  const [stats, setStats] = useState<any>(null)
+  
+
   const [commentSkip, setCommentSkip] = useState(0)
   const [hasMoreComments, setHasMoreComments] = useState(true)
   const COMMENT_LIMIT = 50
@@ -80,7 +84,8 @@ function App() {
         setStatus(data.status)
         
         if (data.status === 'completed') {
-          setActiveTab('chat')
+          setActiveTab('analytics')
+          fetchStats(data.video_id)
           fetchComments(data.video_id, 0, false)
           pollLogs(data.video_id) // Fetch logs once so the tab isn't empty
           checkStatus(data.video_id) // Just to get metadata
@@ -115,9 +120,10 @@ function App() {
         setTimeout(() => checkStatus(id), 2000)
       } else {
         setLoading(false)
+        fetchStats(id)
         fetchComments(id, 0, false) // Fetch comments when done
         pollLogs(id) // Fetch logs so tab isn't empty
-        if (data.status === 'completed') setActiveTab('chat')
+        if (data.status === 'completed') setActiveTab('analytics')
       }
     } catch (e) {
       setLoading(false)
@@ -140,6 +146,20 @@ function App() {
       console.error("Failed to fetch logs")
     }
   }
+
+  const fetchStats = async (id: number) => {
+    try {
+      const res = await fetch(`http://localhost:8000/api/videos/${id}/stats`)
+      if (res.ok) {
+        const data = await res.json()
+        setStats(data)
+      }
+    } catch (e) {
+      console.error("Failed to fetch stats")
+    }
+  }
+
+
 
   const fetchComments = async (id: number, skip = 0, isAppend = false) => {
     try {
@@ -307,12 +327,24 @@ function App() {
               
               <div className="info-panel">
                 <h4>How it works</h4>
-                <p>Echolens is currently analyzing each comment using AI to extract sentiment, product aspects, and complaints. Once ready, you can ask specific questions about the consumer opinions.</p>
+                <p>Echolens is currently analyzing each comment using AI to extract sentiment and complaints. Once ready, you can ask specific questions about the consumer opinions.</p>
               </div>
             </aside>
 
             <section className="main-panel">
               <div className="tab-header">
+                <button 
+                  className={`tab-btn ${activeTab === 'analytics' ? 'active' : ''}`}
+                  onClick={() => setActiveTab('analytics')}
+                >
+                  Analytics
+                </button>
+                <button 
+                  className={`tab-btn ${activeTab === 'compare' ? 'active' : ''}`}
+                  onClick={() => setActiveTab('compare')}
+                >
+                  Compare (VS)
+                </button>
                 <button 
                   className={`tab-btn ${activeTab === 'chat' ? 'active' : ''}`}
                   onClick={() => setActiveTab('chat')}
@@ -334,6 +366,72 @@ function App() {
               </div>
 
               <div className="tab-content">
+                {activeTab === 'analytics' && stats && (
+                  <div className="analytics-container">
+                    <div className="stats-header">
+                      <h3>Analytics Overview</h3>
+                      <p>Sentiment, timeline, and topics for {stats.total_comments} comments.</p>
+                    </div>
+                    
+                    <div className="charts-grid">
+                      <div className="chart-card">
+                        <h4>Sentiment Distribution</h4>
+                        <div className="chart-wrapper">
+                          <ResponsiveContainer width="100%" height={250}>
+                            <PieChart>
+                              <Pie
+                                data={stats.sentiment_distribution}
+                                cx="50%"
+                                cy="50%"
+                                innerRadius={60}
+                                outerRadius={80}
+                                paddingAngle={5}
+                                dataKey="value"
+                              >
+                                {stats.sentiment_distribution.map((entry: any, index: number) => {
+                                  const colors: any = { positive: '#10B981', negative: '#EF4444', neutral: '#9CA3AF', mixed: '#F59E0B' }
+                                  return <Cell key={`cell-${index}`} fill={colors[entry.name] || '#9CA3AF'} />
+                                })}
+                              </Pie>
+                              <Tooltip />
+                              <Legend />
+                            </PieChart>
+                          </ResponsiveContainer>
+                        </div>
+                      </div>
+
+                      <div className="chart-card full-width">
+                        <h4>Comments Timeline</h4>
+                        <div className="chart-wrapper timeline-wrapper">
+                          <ResponsiveContainer width="100%" height={250}>
+                            <LineChart data={stats.timeline}>
+                              <CartesianGrid strokeDasharray="3 3" vertical={false} />
+                              <XAxis dataKey="date" />
+                              <YAxis />
+                              <Tooltip />
+                              <Legend />
+                              <Line type="monotone" dataKey="positive" stroke="#10B981" strokeWidth={2} />
+                              <Line type="monotone" dataKey="negative" stroke="#EF4444" strokeWidth={2} />
+                            </LineChart>
+                          </ResponsiveContainer>
+                        </div>
+                      </div>
+
+                      <div className="chart-card full-width">
+                        <h4>Top Frequent Words</h4>
+                        <div className="word-cloud">
+                          {stats.top_words.map((w: any, i: number) => (
+                            <span key={i} className="word-cloud-item" style={{ fontSize: `${Math.max(0.8, Math.min(2, w.value / 10))}rem` }}>
+                              {w.text} <span className="word-cloud-count">({w.value})</span>
+                            </span>
+                          ))}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+
                 {activeTab === 'chat' && (
                   <div className="chat-container">
 
