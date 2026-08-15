@@ -4,6 +4,41 @@ import os
 import time
 import shutil
 
+def check_env_file(env_path):
+    print("Verifying .env configuration...")
+    if not os.path.exists(env_path):
+        return
+        
+    with open(env_path, 'r', encoding='utf-8') as f:
+        content = f.read()
+
+    errors = []
+    
+    if 'YOUTUBE_API_KEY=' not in content or 'YOUTUBE_API_KEY=KODE_API' in content or 'YOUTUBE_API_KEY=YOUR_YOUTUBE' in content:
+        errors.append("- YOUTUBE_API_KEY is missing or still using the default placeholder.")
+        
+    if 'GEMINI_API_KEY=' not in content or 'GEMINI_API_KEY=KODE_API' in content or 'GEMINI_API_KEY=YOUR_GEMINI' in content:
+        errors.append("- GEMINI_API_KEY is missing or still using the default placeholder.")
+        
+    if 'DATABASE_URL=' not in content:
+        errors.append("- DATABASE_URL is missing.")
+    elif 'PASSWORD_SUPABASE_ANDA' in content or 'YOUR_SUPABASE_PASSWORD' in content:
+        errors.append("- DATABASE_URL still contains the password placeholder. Please replace it with your actual database password.")
+    elif 'postgresql+asyncpg://' not in content:
+        errors.append("- DATABASE_URL must start with 'postgresql+asyncpg://' to work with Echolens backend.")
+
+    if errors:
+        print("\n" + "="*50)
+        print("❌ CONFIGURATION ERROR IN .env FILE ❌")
+        print("="*50)
+        print("Please fix the following issues in backend/.env before running Echolens:\n")
+        for err in errors:
+            print(err)
+        print("\n" + "="*50)
+        sys.exit(1)
+    
+    print("✅ Configuration is valid!")
+
 def setup_backend():
     backend_dir = "backend"
     venv_dir = os.path.join(backend_dir, "venv")
@@ -26,9 +61,11 @@ def setup_backend():
     if not os.path.exists(env_path) and os.path.exists(env_example):
         print("Creating .env file from .env.example...")
         shutil.copy(env_example, env_path)
-        print("NOTE: Please make sure to update your .env with actual API keys later!")
+    
+    # 3. Validate .env contents
+    check_env_file(env_path)
 
-    # 3. Install Requirements
+    # 4. Install Requirements
     print("Installing/Updating Backend Dependencies...")
     subprocess.run([python_exec, "-m", "pip", "install", "-r", "requirements.txt"], cwd=backend_dir, check=True)
 
