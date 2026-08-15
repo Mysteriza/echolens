@@ -32,6 +32,7 @@ class Comment(Base):
     published_at = Column(DateTime(timezone=True))
     like_count = Column(Integer, default=0)
     is_reply = Column(Boolean, default=False)
+    is_spam = Column(Boolean, default=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     video = relationship("Video", back_populates="comments")

@@ -2,6 +2,10 @@ from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, text, desc
 from typing import List, Dict
+from fastapi.responses import StreamingResponse
+import io
+import csv
+import re
 
 from database.session import get_db, async_session
 from models.db import Video, Comment, CommentAnalysis, CommentAspect, CommentEmbedding, VideoLog, VideoReport
@@ -68,12 +72,34 @@ async def process_video_background(video_id: int, youtube_id: str, limit: int):
             
             for i in range(0, len(comments_data), batch_size):
                 chunk = comments_data[i:i + batch_size]
-                chunk_texts = [c['text'] for c in chunk]
                 
-                # Batch predict
-                sentiments = nlp_service.analyze_sentiments_batch(chunk_texts)
+                # Spam Detection Logic (Regex for URLs, or repeating words)
+                spam_pattern = re.compile(r'(http[s]?://|www\.)|(?:[a-zA-Z0-9]\s*){25,}|(\b\w+\b)(?:\s+\2){4,}', re.IGNORECASE)
                 
-                for c_data, sentiment_data in zip(chunk, sentiments):
+                valid_chunk = []
+                for c in chunk:
+                    # Mark spam if it matches regex or is extremely short
+                    if spam_pattern.search(c['text']) or len(c['text']) < 2:
+                        c['is_spam'] = True
+                    else:
+                        c['is_spam'] = False
+                        valid_chunk.append(c)
+                
+                # Batch predict only for non-spam comments
+                valid_texts = [c['text'] for c in valid_chunk]
+                sentiments = nlp_service.analyze_sentiments_batch(valid_texts) if valid_texts else []
+                
+                # Reconstruct chunk with assigned sentiments
+                processed_chunk = []
+                sentiment_idx = 0
+                for c in chunk:
+                    if c['is_spam']:
+                        processed_chunk.append((c, {"sentiment": "neutral", "confidence": 0.0}))
+                    else:
+                        processed_chunk.append((c, sentiments[sentiment_idx]))
+                        sentiment_idx += 1
+                
+                for c_data, sentiment_data in processed_chunk:
                     stmt = select(Comment).where(Comment.youtube_id == c_data['youtube_id'])
                     existing_comment = (await db.execute(stmt)).scalar_one_or_none()
                     
@@ -91,7 +117,8 @@ async def process_video_background(video_id: int, youtube_id: str, limit: int):
                             text=c_data['text'],
                             published_at=pub_dt,
                             like_count=c_data['like_count'],
-                            is_reply=c_data['is_reply']
+                            is_reply=c_data['is_reply'],
+                            is_spam=c_data['is_spam']
                         )
                         db.add(db_comment)
                         await db.flush()
@@ -195,16 +222,17 @@ async def get_video_logs(video_id: int, db: AsyncSession = Depends(get_db)):
     return [{"message": l.message, "level": l.level, "created_at": l.created_at.isoformat()} for l in logs]
 
 @router.get("/{video_id}/comments")
-async def get_video_comments(video_id: int, db: AsyncSession = Depends(get_db)):
+async def get_video_comments(video_id: int, skip: int = 0, limit: int = 100, db: AsyncSession = Depends(get_db)):
     stmt = text("""
-        SELECT c.id, c.author_name, c.text, c.like_count, 
-               ca.sentiment, ca.summary, ca.is_complaint, ca.is_praise
+        SELECT c.id, c.author_name, c.text, c.like_count, c.is_spam,
+               ca.sentiment, ca.summary, ca.is_complaint, ca.is_praise, ca.confidence
         FROM comments c
         LEFT JOIN comment_analysis ca ON c.id = ca.comment_id
         WHERE c.video_id = :video_id
         ORDER BY c.like_count DESC
+        OFFSET :skip LIMIT :limit
     """)
-    result = await db.execute(stmt, {"video_id": video_id})
+    result = await db.execute(stmt, {"video_id": video_id, "skip": skip, "limit": limit})
     comments = []
     for row in result:
         comments.append({
@@ -212,7 +240,9 @@ async def get_video_comments(video_id: int, db: AsyncSession = Depends(get_db)):
             "author": row.author_name,
             "text": row.text,
             "likes": row.like_count,
+            "is_spam": row.is_spam,
             "sentiment": row.sentiment,
+            "confidence": row.confidence,
             "summary": row.summary,
             "is_complaint": row.is_complaint,
             "is_praise": row.is_praise
@@ -263,3 +293,42 @@ async def get_video_report(video_id: int, db: AsyncSession = Depends(get_db)):
         "top_complaints": report.top_complaints,
         "top_praises": report.top_praises
     }
+
+@router.get("/{video_id}/export")
+async def export_video_comments(video_id: int, db: AsyncSession = Depends(get_db)):
+    video = await db.get(Video, video_id)
+    if not video:
+        raise HTTPException(status_code=404, detail="Video not found")
+        
+    stmt = text("""
+        SELECT c.author_name, c.text, c.like_count, c.is_spam,
+               ca.sentiment, ca.confidence
+        FROM comments c
+        LEFT JOIN comment_analysis ca ON c.id = ca.comment_id
+        WHERE c.video_id = :video_id
+        ORDER BY c.like_count DESC
+    """)
+    result = await db.execute(stmt, {"video_id": video_id})
+    
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["Author", "Comment", "Likes", "Is Spam", "Sentiment", "Confidence Score"])
+    
+    for row in result:
+        conf_str = f"{row.confidence*100:.2f}%" if row.confidence is not None else "N/A"
+        writer.writerow([
+            row.author_name,
+            row.text,
+            row.like_count,
+            "Yes" if row.is_spam else "No",
+            row.sentiment,
+            conf_str
+        ])
+        
+    output.seek(0)
+    
+    return StreamingResponse(
+        iter([output.getvalue()]), 
+        media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename=echolens_export_{video_id}.csv"}
+    )

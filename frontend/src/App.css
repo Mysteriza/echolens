@@ -767,6 +767,8 @@ body {
 
 .rc-badge.issue { background: #FEE2E2; color: #DC2626; border: 1px solid #FECACA;}
 .rc-badge.praise { background: #DCFCE7; color: #16A34A; border: 1px solid #BBF7D0;}
+.rc-badge.spam { background: #F3F4F6; color: #6B7280; border: 1px solid #E5E7EB; text-decoration: line-through; }
+.rc-badge.confidence { background: #F8FAFC; color: #475569; border: 1px solid #E2E8F0; font-family: var(--font-mono); }
 
 .rc-text {
   font-size: 0.9375rem;
@@ -787,6 +789,44 @@ body {
 .empty-state {
   color: var(--text-tertiary);
   font-style: italic;
+}
+
+.btn-export {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  background: var(--bg-surface);
+  color: var(--text-primary);
+  border: 1px solid var(--border-strong);
+  padding: 0.5rem 1rem;
+  border-radius: var(--radius-sm);
+  font-size: 0.875rem;
+  font-weight: 500;
+  text-decoration: none;
+  transition: all 0.2s ease;
+}
+
+.btn-export:hover {
+  background: var(--bg-page);
+  border-color: var(--border-focus);
+}
+
+.btn-load-more {
+  width: 100%;
+  padding: 1rem;
+  background: transparent;
+  border: 1px dashed var(--border-strong);
+  color: var(--text-secondary);
+  font-weight: 500;
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.btn-load-more:hover {
+  background: var(--bg-surface-hover);
+  color: var(--text-primary);
+  border-color: var(--border-focus);
 }
 
 /* Terminal Logs Tab */

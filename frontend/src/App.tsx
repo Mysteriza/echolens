@@ -19,17 +19,12 @@ interface RawComment {
   author: string;
   text: string;
   likes: number;
+  is_spam: boolean;
   sentiment: string;
+  confidence: number;
   summary: string;
   is_complaint: boolean;
   is_praise: boolean;
-}
-
-interface VideoReport {
-  overall_sentiment: string;
-  summary: string;
-  top_complaints: string;
-  top_praises: string;
 }
 
 function App() {
@@ -48,6 +43,9 @@ function App() {
   const [activeTab, setActiveTab] = useState<'chat' | 'comments' | 'logs'>('chat')
   const [logs, setLogs] = useState<LogEntry[]>([])
   const [rawComments, setRawComments] = useState<RawComment[]>([])
+  const [commentSkip, setCommentSkip] = useState(0)
+  const [hasMoreComments, setHasMoreComments] = useState(true)
+  const COMMENT_LIMIT = 50
   
   const chatEndRef = useRef<HTMLDivElement>(null)
   const logsEndRef = useRef<HTMLDivElement>(null)
@@ -83,7 +81,7 @@ function App() {
         
         if (data.status === 'completed') {
           setActiveTab('chat')
-          fetchComments(data.video_id)
+          fetchComments(data.video_id, 0, false)
           pollLogs(data.video_id) // Fetch logs once so the tab isn't empty
           checkStatus(data.video_id) // Just to get metadata
         } else {
@@ -117,8 +115,7 @@ function App() {
         setTimeout(() => checkStatus(id), 2000)
       } else {
         setLoading(false)
-        fetchComments(id) // Fetch comments when done
-        fetchReport(id)
+        fetchComments(id, 0, false) // Fetch comments when done
         pollLogs(id) // Fetch logs so tab isn't empty
         if (data.status === 'completed') setActiveTab('chat')
       }
@@ -144,13 +141,31 @@ function App() {
     }
   }
 
-  const fetchComments = async (id: number) => {
+  const fetchComments = async (id: number, skip = 0, isAppend = false) => {
     try {
-      const res = await fetch(`http://localhost:8000/api/videos/${id}/comments`)
+      const res = await fetch(`http://localhost:8000/api/videos/${id}/comments?skip=${skip}&limit=${COMMENT_LIMIT}`)
       const data = await res.json()
-      setRawComments(data)
+      
+      if (data.length < COMMENT_LIMIT) {
+        setHasMoreComments(false)
+      } else {
+        setHasMoreComments(true)
+      }
+
+      if (isAppend) {
+        setRawComments(prev => [...prev, ...data])
+      } else {
+        setRawComments(data)
+      }
+      setCommentSkip(skip)
     } catch (e) {
       console.error("Failed to fetch comments")
+    }
+  }
+
+  const handleLoadMore = () => {
+    if (videoId) {
+      fetchComments(videoId, commentSkip + COMMENT_LIMIT, true)
     }
   }
 
@@ -416,9 +431,21 @@ function App() {
 
                 {activeTab === 'comments' && (
                   <div className="comments-container">
-                    <div className="comments-header">
-                      <h3>Collected Comments ({rawComments.length})</h3>
-                      <p>Raw data and AI structured analysis for each comment.</p>
+                    <div className="comments-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                      <div>
+                        <h3>Collected Comments ({rawComments.length})</h3>
+                        <p>Raw data and AI structured analysis for each comment.</p>
+                      </div>
+                      <a 
+                        href={`http://localhost:8000/api/videos/${videoId}/export`} 
+                        className="btn-export"
+                        target="_blank"
+                        rel="noreferrer"
+                        download
+                      >
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
+                        Export CSV
+                      </a>
                     </div>
                     {rawComments.length === 0 ? (
                       <div className="empty-state">No comments available yet.</div>
@@ -429,7 +456,9 @@ function App() {
                             <div className="rc-header">
                               <span className="rc-author">@{c.author}</span>
                               <div className="rc-badges">
+                                {c.is_spam && <span className="rc-badge spam">Spam Detected</span>}
                                 {c.sentiment && <span className={`rc-badge sentiment-${c.sentiment}`}>IndoBERT: {c.sentiment}</span>}
+                                {c.confidence !== null && c.confidence !== undefined && <span className="rc-badge confidence">{(c.confidence * 100).toFixed(1)}% Confident</span>}
                                 {c.is_complaint && <span className="rc-badge issue">Complaint</span>}
                                 {c.is_praise && <span className="rc-badge praise">Praise</span>}
                               </div>
@@ -437,6 +466,12 @@ function App() {
                             <p className="rc-text">{c.text}</p>
                           </div>
                         ))}
+                        
+                        {hasMoreComments && (
+                          <button className="btn-load-more" onClick={handleLoadMore}>
+                            Load More Comments
+                          </button>
+                        )}
                       </div>
                     )}
                   </div>
