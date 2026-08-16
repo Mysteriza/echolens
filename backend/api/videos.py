@@ -57,11 +57,15 @@ async def process_video_background(video_id: int, youtube_id: str, limit: int):
             )
 
             # 1. Fetch Comments
-            limit_str = "All" if limit >= 99999 else str(limit)
+            if limit >= 99999:
+                log_message = "Fetching all comments from YouTube API..."
+            else:
+                log_message = f"Fetching comments from YouTube API (Limited to {limit} comments)..."
+                
             await add_log(
                 db,
                 video_id,
-                f"Fetching comments from YouTube API (Limited to {limit_str})...",
+                log_message,
                 "INFO",
             )
             yt_service = YouTubeService()
@@ -117,13 +121,19 @@ async def process_video_background(video_id: int, youtube_id: str, limit: int):
 
             for i in range(0, len(comments_data), batch_size):
                 if video_id in cancellation_tokens:
-                    await add_log(
-                        db, video_id, "Process cancelled by user. Cleaning up...", "WARNING"
-                    )
-                    # Delete the video from DB (which cascades to comments, analysis, logs)
-                    await db.delete(video)
-                    await db.commit()
-                    cancellation_tokens.remove(video_id)
+                    try:
+                        v = await db.get(Video, video_id)
+                        if v:
+                            await add_log(
+                                db, video_id, "Process cancelled by user. Cleaning up...", "WARNING"
+                            )
+                            await db.delete(v)
+                            await db.commit()
+                    except Exception:
+                        pass
+                        
+                    if video_id in cancellation_tokens:
+                        cancellation_tokens.remove(video_id)
                     return
 
                 chunk = comments_data[i : i + batch_size]
@@ -279,11 +289,21 @@ async def process_video(
     existing_video = (await db.execute(stmt)).scalar_one_or_none()
 
     if existing_video:
-        return {
-            "message": "Video already processed or processing",
-            "video_id": existing_video.id,
-            "status": existing_video.analysis_status,
-        }
+        if existing_video.id in cancellation_tokens:
+            # Race condition fix: User clicked 'Stop' and immediately re-analyzed before the background 
+            # task had time to clean up. We aggressively delete it here so a fresh one can start.
+            try:
+                await db.delete(existing_video)
+                await db.commit()
+            except Exception:
+                pass
+            existing_video = None
+        else:
+            return {
+                "message": "Video already processed or processing",
+                "video_id": existing_video.id,
+                "status": existing_video.analysis_status,
+            }
 
     yt_service = YouTubeService()
     try:

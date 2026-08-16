@@ -84,16 +84,24 @@ def setup_frontend():
 
 def start_backend(python_exec):
     print("Starting backend...")
+    kwargs = {}
+    if os.name == 'nt':
+        kwargs['creationflags'] = subprocess.CREATE_NEW_PROCESS_GROUP
     return subprocess.Popen(
         [python_exec, "-m", "uvicorn", "main:app", "--reload", "--port", "8000", "--no-access-log"],
-        cwd="backend"
+        cwd="backend",
+        **kwargs
     )
 
 def start_frontend(npm_cmd):
     print("Starting frontend...")
+    kwargs = {}
+    if os.name == 'nt':
+        kwargs['creationflags'] = subprocess.CREATE_NEW_PROCESS_GROUP
     return subprocess.Popen(
         [npm_cmd, "run", "dev"],
-        cwd="frontend"
+        cwd="frontend",
+        **kwargs
     )
 
 def main():

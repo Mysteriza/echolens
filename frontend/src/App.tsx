@@ -64,7 +64,27 @@ function App() {
 
   const [currentPage, setCurrentPage] = useState(1)
   const [commentLimit, setCommentLimit] = useState(15)
+
+  // Modal State
+  const [modalConfig, setModalConfig] = useState<{
+    isOpen: boolean;
+    type: 'reset' | 'stop' | null;
+    step: 1 | 2;
+  }>({ isOpen: false, type: null, step: 1 });
   
+  // Toast State
+  const [toast, setToast] = useState<{
+    message: string;
+    type: 'success' | 'error' | null;
+  }>({ message: '', type: null });
+
+  const showToast = (message: string, type: 'success' | 'error') => {
+    setToast({ message, type });
+    setTimeout(() => {
+      setToast({ message: '', type: null });
+    }, 3000);
+  };
+
   const chatEndRef = useRef<HTMLDivElement>(null)
   const logsEndRef = useRef<HTMLDivElement>(null)
 
@@ -219,31 +239,34 @@ function App() {
   }
 
   const handleResetDatabase = async () => {
-    if (confirm("Are you sure you want to completely reset the database? This will permanently delete ALL videos, comments, and analysis data. This action cannot be undone.")) {
-      // Second confirmation as requested previously
-      if (confirm("FINAL WARNING: All data will be lost. Proceed?")) {
-        try {
-          const res = await fetch('http://localhost:8000/api/videos/reset-database', { method: 'POST' })
-          if (res.ok) {
-            alert("Database reset successfully.")
-            setVideoId(null)
-            setStatus('')
-            setUrl('')
-            setVideoData({})
-          } else {
-            alert("Failed to reset database.")
-          }
-        } catch (e) {
-          console.error(e)
-          alert("Error connecting to server.")
-        }
+    setModalConfig({ isOpen: true, type: 'reset', step: 1 });
+  }
+
+  const executeResetDatabase = async () => {
+    try {
+      const res = await fetch('http://localhost:8000/api/videos/reset-database', { method: 'POST' })
+      if (res.ok) {
+        showToast("Database reset successfully.", "success")
+        setVideoId(null)
+        setStatus('')
+        setUrl('')
+        setVideoData({})
+      } else {
+        showToast("Failed to reset database.", "error")
       }
+    } catch (e) {
+      console.error(e)
+      showToast("Error connecting to server.", "error")
     }
+    setModalConfig({ isOpen: false, type: null, step: 1 });
   }
 
   const handleStopProcess = async () => {
-    if (confirm("Are you sure you want to stop the ongoing analysis? This will cancel the process and delete the current video data.")) {
-      if (!videoId) return;
+    setModalConfig({ isOpen: true, type: 'stop', step: 1 });
+  }
+
+  const executeStopProcess = async () => {
+    if (videoId) {
       try {
         await fetch(`http://localhost:8000/api/videos/${videoId}/cancel`, { method: 'POST' });
       } catch (e) {
@@ -254,6 +277,7 @@ function App() {
       setUrl('');
       setVideoData({});
     }
+    setModalConfig({ isOpen: false, type: null, step: 1 });
   }
 
 
@@ -685,7 +709,7 @@ function App() {
                 {activeTab === 'comments' && (
                   <div className="comments-container">
                     <div className="comments-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                      <div className="tab-header">
+                      <div className="section-title">
                         <h3>Collected Comments ({videoData.processed_comments || rawComments.length})</h3>
                         <p>Raw data and AI structured analysis for each comment.</p>
                       </div>
@@ -786,6 +810,67 @@ function App() {
           </div>
         )}
       </main>
+
+      {/* Confirmation Modal */}
+      {modalConfig.isOpen && (
+        <div className="modal-overlay">
+          <div className="modal-container">
+            <div className="modal-icon-wrapper">
+              <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="modal-icon">
+                <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path>
+                <line x1="12" y1="9" x2="12" y2="13"></line>
+                <line x1="12" y1="17" x2="12.01" y2="17"></line>
+              </svg>
+            </div>
+            <h3 className="modal-title">
+              {modalConfig.type === 'reset' 
+                ? (modalConfig.step === 1 ? 'Reset Database' : 'Final Warning') 
+                : 'Stop Process'}
+            </h3>
+            <p className="modal-message">
+              {modalConfig.type === 'reset' && modalConfig.step === 1 && "Are you sure you want to completely reset the database? This will permanently delete ALL videos, comments, and analysis data. This action cannot be undone."}
+              {modalConfig.type === 'reset' && modalConfig.step === 2 && "This is your final warning. All data will be irrecoverably lost. Do you wish to proceed?"}
+              {modalConfig.type === 'stop' && "Are you sure you want to stop the ongoing analysis? This will cancel the background process and delete the current video's partial data."}
+            </p>
+            <div className="modal-actions">
+              <button 
+                className="btn-modal-cancel" 
+                onClick={() => setModalConfig({ isOpen: false, type: null, step: 1 })}
+              >
+                Cancel
+              </button>
+              <button 
+                className="btn-modal-confirm" 
+                onClick={() => {
+                  if (modalConfig.type === 'reset') {
+                    if (modalConfig.step === 1) {
+                      setModalConfig(prev => ({ ...prev, step: 2 }));
+                    } else {
+                      executeResetDatabase();
+                    }
+                  } else if (modalConfig.type === 'stop') {
+                    executeStopProcess();
+                  }
+                }}
+              >
+                {modalConfig.type === 'reset' && modalConfig.step === 1 ? 'Yes, Reset Database' : 'Yes, Proceed'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Toast Notification */}
+      {toast.type && (
+        <div className={`toast-notification ${toast.type} animate-slide-up`}>
+          {toast.type === 'success' ? (
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"></path><polyline points="22 4 12 14.01 9 11.01"></polyline></svg>
+          ) : (
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="8" x2="12" y2="12"></line><line x1="12" y1="16" x2="12.01" y2="16"></line></svg>
+          )}
+          <span>{toast.message}</span>
+        </div>
+      )}
     </div>
   )
 }
