@@ -30,26 +30,14 @@ interface RawComment {
 
 function App() {
   const [url, setUrl] = useState('')
-  const [limit, setLimit] = useState(300)
+  const [limit, setLimit] = useState(99999)
   const [videoId, setVideoId] = useState<number | null>(null)
   const [status, setStatus] = useState<string>('')
   const [videoData, setVideoData] = useState<VideoMetadata>({})
   
   const [geminiEnabled, setGeminiEnabled] = useState(true)
   
-  useEffect(() => {
-    fetch('http://localhost:8000/health')
-      .then(res => res.json())
-      .then(data => {
-        setGeminiEnabled(data.gemini_enabled)
-        // If chat was active and gemini is disabled, switch to analytics
-        if (!data.gemini_enabled && activeTab === 'chat') {
-          setActiveTab('analytics')
-        }
-      })
-      .catch(e => console.error("Failed to fetch health check", e))
-  }, [])
-  
+
   const [loading, setLoading] = useState(false)
   const [asking, setAsking] = useState(false)
   
@@ -58,15 +46,45 @@ function App() {
   const [rawComments, setRawComments] = useState<RawComment[]>([])
   const [stats, setStats] = useState<any>(null)
   
+  const [question, setQuestion] = useState('')
+  const [chatHistory, setChatHistory] = useState<any[]>([])
 
-  const [commentSkip, setCommentSkip] = useState(0)
-  const [hasMoreComments, setHasMoreComments] = useState(true)
-  const COMMENT_LIMIT = 50
+  useEffect(() => {
+    fetch('http://localhost:8000/health')
+      .then(res => res.json())
+      .then(data => {
+        setGeminiEnabled(data.gemini_enabled)
+        if (!data.gemini_enabled && activeTab === 'chat') {
+          setActiveTab('analytics')
+        }
+      })
+      .catch(e => console.error("Failed to fetch health check", e))
+  }, [activeTab])
+  
+
+  const [currentPage, setCurrentPage] = useState(1)
+  const [commentLimit, setCommentLimit] = useState(15)
   
   const chatEndRef = useRef<HTMLDivElement>(null)
   const logsEndRef = useRef<HTMLDivElement>(null)
 
   const [showDropdown, setShowDropdown] = useState(false)
+  const dropdownRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    function handleClickOutside(event: MouseEvent) {
+      if (dropdownRef.current && !dropdownRef.current.contains(event.target as Node)) {
+        setShowDropdown(false)
+      }
+    }
+    
+    if (showDropdown) {
+      document.addEventListener("mousedown", handleClickOutside)
+    }
+    return () => {
+      document.removeEventListener("mousedown", handleClickOutside)
+    }
+  }, [showDropdown])
 
   const limitOptions = [
     { value: 100, label: '100' },
@@ -133,7 +151,8 @@ function App() {
       } else {
         setLoading(false)
         fetchStats(id)
-        fetchComments(id, 0, false) // Fetch comments when done
+        setCurrentPage(1)
+        fetchComments(id, 1, commentLimit) // Fetch comments when done
         pollLogs(id) // Fetch logs so tab isn't empty
         if (data.status === 'completed') setActiveTab('analytics')
       }
@@ -173,27 +192,22 @@ function App() {
 
 
 
-  const fetchComments = async (id: number, skip = 0, isAppend = false) => {
+  const fetchComments = async (id: number, page: number, limit: number) => {
     try {
-      const res = await fetch(`http://localhost:8000/api/videos/${id}/comments?skip=${skip}&limit=${COMMENT_LIMIT}`)
+      const skip = (page - 1) * limit;
+      const res = await fetch(`http://localhost:8000/api/videos/${id}/comments?skip=${skip}&limit=${limit}`)
       const data = await res.json()
-      
-      if (data.length < COMMENT_LIMIT) {
-        setHasMoreComments(false)
-      } else {
-        setHasMoreComments(true)
-      }
-
-      if (isAppend) {
-        setRawComments(prev => [...prev, ...data])
-      } else {
-        setRawComments(data)
-      }
-      setCommentSkip(skip)
+      setRawComments(data)
     } catch (e) {
       console.error("Failed to fetch comments")
     }
   }
+
+  useEffect(() => {
+    if (videoId && status === 'completed') {
+      fetchComments(videoId, currentPage, commentLimit)
+    }
+  }, [currentPage, commentLimit])
 
   const handleNewAnalysis = () => {
     setVideoId(null)
@@ -205,28 +219,43 @@ function App() {
   }
 
   const handleResetDatabase = async () => {
-    if (window.confirm("Are you sure you want to delete ALL analyzed data? This action cannot be undone.")) {
-      if (window.confirm("FINAL WARNING: All YouTube videos and comments data in the database will be permanently wiped. Proceed?")) {
+    if (confirm("Are you sure you want to completely reset the database? This will permanently delete ALL videos, comments, and analysis data. This action cannot be undone.")) {
+      // Second confirmation as requested previously
+      if (confirm("FINAL WARNING: All data will be lost. Proceed?")) {
         try {
           const res = await fetch('http://localhost:8000/api/videos/reset-database', { method: 'POST' })
           if (res.ok) {
-            alert("Database has been reset successfully.")
-            window.location.reload()
+            alert("Database reset successfully.")
+            setVideoId(null)
+            setStatus('')
+            setUrl('')
+            setVideoData({})
           } else {
             alert("Failed to reset database.")
           }
         } catch (e) {
+          console.error(e)
           alert("Error connecting to server.")
         }
       }
     }
   }
 
-  const handleLoadMore = () => {
-    if (videoId) {
-      fetchComments(videoId, commentSkip + COMMENT_LIMIT, true)
+  const handleStopProcess = async () => {
+    if (confirm("Are you sure you want to stop the ongoing analysis? This will cancel the process and delete the current video data.")) {
+      if (!videoId) return;
+      try {
+        await fetch(`http://localhost:8000/api/videos/${videoId}/cancel`, { method: 'POST' });
+      } catch (e) {
+        console.error(e);
+      }
+      setVideoId(null);
+      setStatus('');
+      setUrl('');
+      setVideoData({});
     }
   }
+
 
   const handleAsk = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -245,22 +274,36 @@ function App() {
         body: JSON.stringify({ question: userQ })
       })
       const data = await res.json()
-      setChatHistory(prev => [...prev, { type: 'answer', data }])
+      setChatHistory(prev => [...prev, { type: 'answer', content: data }])
     } catch (e) {
       setChatHistory(prev => [...prev, { type: 'error', content: 'Failed to retrieve answer from server.' }])
     }
     setAsking(false)
   }
 
+  const handleExportChat = () => {
+    if (chatHistory.length === 0) return;
+    const exportData = {
+      video: videoData,
+      export_date: new Date().toISOString(),
+      chat_history: chatHistory
+    };
+    const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(exportData, null, 2));
+    const a = document.createElement('a');
+    a.href = dataStr;
+    a.download = `echolens-chat-${videoId}-${new Date().getTime()}.json`;
+    a.click();
+  };
+
   useEffect(() => {
     if (chatEndRef.current && activeTab === 'chat') {
-      chatEndRef.current.scrollIntoView({ behavior: 'smooth' })
+      chatEndRef.current.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
     }
   }, [chatHistory, asking, activeTab])
 
   useEffect(() => {
     if (logsEndRef.current && activeTab === 'logs') {
-      logsEndRef.current.scrollIntoView({ behavior: 'smooth' })
+      logsEndRef.current.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
     }
   }, [logs, activeTab])
 
@@ -269,8 +312,30 @@ function App() {
     let label = 'Initializing...';
     let dotClass = 'pending';
     
-    if (status === 'collecting') { label = 'Fetching comments...'; dotClass = 'collecting'; }
-    if (status === 'analyzing') { label = `Analyzing AI (${videoData.processed_comments || 0} processed)...`; dotClass = 'analyzing'; }
+    // Extract total fetched comments from logs to calculate percentage
+    let totalFetched = 0;
+    if (logs && logs.length > 0) {
+      const fetchLog = logs.find(l => l.message && l.message.includes('Successfully fetched'));
+      if (fetchLog) {
+        const match = fetchLog.message.match(/Successfully fetched (\d+) comments/);
+        if (match && match[1]) totalFetched = parseInt(match[1], 10);
+      }
+    }
+
+    if (status === 'collecting') { 
+      label = 'Fetching comments...'; 
+      dotClass = 'collecting'; 
+    }
+    if (status === 'analyzing') { 
+      const processed = videoData.processed_comments || 0;
+      if (totalFetched > 0) {
+        const pct = Math.round((processed / totalFetched) * 100);
+        label = `Analyzing AI (${pct}% - ${processed}/${totalFetched} processed)...`;
+      } else {
+        label = `Analyzing AI (${processed} processed)...`; 
+      }
+      dotClass = 'analyzing'; 
+    }
     if (status === 'completed') { label = `Ready (${videoData.processed_comments || 0} comments)`; dotClass = 'completed'; }
     if (status === 'failed') { label = 'Analysis failed'; dotClass = 'failed'; }
     
@@ -295,57 +360,58 @@ function App() {
 
       <main className="main-content">
         {!videoId ? (
-          <div className="hero">
-            <h1>Understand what consumers actually think.</h1>
-            <p className="subtitle">
-              Paste a YouTube URL to extract, analyze, and query hundreds of comments instantly using AI.
-            </p>
+          <div className="hero-section">
+            <div className="hero-text">
+              <h1>Understand what consumers actually think.</h1>
+              <p>
+                Paste a YouTube URL to extract, analyze, and query hundreds of comments instantly using AI.
+              </p>
+            </div>
             
-            <form onSubmit={handleProcess} className="hero-form">
-              <div className="input-row">
-                <div className="input-wrapper">
-                  <svg className="youtube-icon" viewBox="0 0 24 24" fill="currentColor"><path d="M23.498 6.186a3.016 3.016 0 0 0-2.122-2.136C19.505 3.545 12 3.545 12 3.545s-7.505 0-9.377.505A3.017 3.017 0 0 0 .502 6.186C0 8.07 0 12 0 12s0 3.93.502 5.814a3.016 3.016 0 0 0 2.122 2.136c1.871.505 9.376.505 9.376.505s7.505 0 9.377-.505a3.015 3.015 0 0 0 2.122-2.136C24 15.93 24 12 24 12s0-3.93-.502-5.814zM9.545 15.568V8.432L15.818 12l-6.273 3.568z"/></svg>
-                  <input 
-                    type="text" 
-                    placeholder="https://www.youtube.com/watch?v=..." 
-                    value={url}
-                    onChange={e => setUrl(e.target.value)}
-                    disabled={loading}
-                    autoFocus
-                  />
-                </div>
+            <form onSubmit={handleProcess} className="hero-search-form">
+              <div className="hero-search-bar">
+                <svg className="search-icon" width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M23.498 6.186a3.016 3.016 0 0 0-2.122-2.136C19.505 3.545 12 3.545 12 3.545s-7.505 0-9.377.505A3.017 3.017 0 0 0 .502 6.186C0 8.07 0 12 0 12s0 3.93.502 5.814a3.016 3.016 0 0 0 2.122 2.136c1.871.505 9.376.505 9.376.505s7.505 0 9.377-.505a3.015 3.015 0 0 0 2.122-2.136C24 15.93 24 12 24 12s0-3.93-.502-5.814zM9.545 15.568V8.432L15.818 12l-6.273 3.568z"/></svg>
+                <input 
+                  className="hero-search-input"
+                  type="text" 
+                  placeholder="https://www.youtube.com/watch?v=..." 
+                  value={url}
+                  onChange={e => setUrl(e.target.value)}
+                  disabled={loading}
+                  autoFocus
+                />
                 
-                <div className="limit-selector-custom" style={{ width: '200px' }}>
-                  <div className="dropdown-container">
-                    <div 
-                      className="dropdown-trigger" 
-                      onClick={() => !loading && setShowDropdown(!showDropdown)}
-                      style={{ opacity: loading ? 0.5 : 1, cursor: loading ? 'not-allowed' : 'pointer', height: '100%', border: 'none', borderLeft: '1px solid #E5E7EB', borderRadius: '0 50px 50px 0', backgroundColor: '#F9FAFB' }}
-                    >
-                      <span>Analyze: {limitOptions.find(o => o.value === limit)?.label}</span>
-                      <svg className="dropdown-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="6 9 12 15 18 9"></polyline></svg>
-                    </div>
-                    
-                    {showDropdown && (
-                      <ul className="dropdown-menu">
-                        {limitOptions.map(opt => (
-                          <li 
-                            key={opt.value} 
-                            onClick={() => { setLimit(opt.value); setShowDropdown(false); }}
-                            className={limit === opt.value ? 'selected' : ''}
-                          >
-                            {opt.label}
-                          </li>
-                        ))}
-                      </ul>
-                    )}
+                <div className="hero-search-divider"></div>
+                
+                <div className="dropdown-container" ref={dropdownRef}>
+                  <div 
+                    className="dropdown-trigger" 
+                    onClick={() => !loading && setShowDropdown(!showDropdown)}
+                    style={{ opacity: loading ? 0.5 : 1, cursor: loading ? 'not-allowed' : 'pointer' }}
+                  >
+                    <span>Analyze: {limitOptions.find(o => o.value === limit)?.label}</span>
+                    <svg className="dropdown-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="6 9 12 15 18 9"></polyline></svg>
                   </div>
+                  
+                  {showDropdown && (
+                    <ul className="dropdown-menu">
+                      {limitOptions.map(opt => (
+                        <li 
+                          key={opt.value} 
+                          onClick={() => { setLimit(opt.value); setShowDropdown(false); }}
+                          className={limit === opt.value ? 'selected' : ''}
+                        >
+                          {opt.label}
+                        </li>
+                      ))}
+                    </ul>
+                  )}
                 </div>
+
+                <button type="submit" className="hero-search-button" disabled={!url || loading}>
+                  {loading ? 'Starting...' : 'Analyze Video'}
+                </button>
               </div>
-              
-              <button type="submit" className="btn-analyze-large" disabled={!url || loading}>
-                {loading ? 'Starting...' : 'Analyze Video'}
-              </button>
             </form>
             
             <div className="hero-about">
@@ -392,6 +458,11 @@ function App() {
                 <p>Echolens is currently analyzing each comment using AI to extract sentiment and complaints. Once ready, you can ask specific questions about the consumer opinions.</p>
               </div>
               <div className="sidebar-actions">
+                {(status === 'collecting' || status === 'analyzing') && (
+                  <button className="btn-sidebar-action stop-process" onClick={handleStopProcess} style={{ backgroundColor: '#EF4444', color: 'white', border: 'none' }}>
+                    Stop Process
+                  </button>
+                )}
                 <button className="btn-sidebar-action new-analysis" onClick={handleNewAnalysis}>
                   + New Analysis
                 </button>
@@ -498,9 +569,16 @@ function App() {
                   </div>
                 )}
 
-
                 {activeTab === 'chat' && geminiEnabled && (
                   <div className="chat-container">
+                    {chatHistory.length > 0 && (
+                      <div className="chat-actions" style={{ display: 'flex', justifyContent: 'flex-end', paddingBottom: '1rem', borderBottom: '1px solid var(--border-light)', marginBottom: '1rem' }}>
+                        <button className="btn-export" onClick={handleExportChat} style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.85rem' }}>
+                          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
+                          Export Chat to JSON
+                        </button>
+                      </div>
+                    )}
                     <div className="chat-history">
                       {chatHistory.length === 0 ? (
                         <div className="empty-chat">
@@ -531,16 +609,16 @@ function App() {
                                   </div>
                                 )}
                                 
-                                {msg.content.supporting_evidence && msg.content.supporting_evidence.length > 0 && (
+                                {msg.content.evidence && msg.content.evidence.length > 0 && (
                                   <div className="evidence-section">
                                     <div className="evidence-title">Sources from Comments:</div>
                                     <div className="evidence-grid">
-                                      {msg.content.supporting_evidence.map((ev: any, j: number) => (
+                                      {msg.content.evidence.map((ev: any, j: number) => (
                                         <div key={j} className="evidence-item">
                                           <div className="evidence-item-header">
                                             <span className="evidence-author">{ev.author}</span>
-                                            <span className={`evidence-sentiment ${ev.sentiment.toLowerCase()}`}>
-                                              {ev.sentiment}
+                                            <span className={`evidence-sentiment ${ev.sentiment?.toLowerCase() || 'neutral'}`}>
+                                              {ev.sentiment?.toUpperCase() || 'NEUTRAL'}
                                             </span>
                                           </div>
                                           <div className="evidence-quote">"{ev.text}"</div>
@@ -607,8 +685,8 @@ function App() {
                 {activeTab === 'comments' && (
                   <div className="comments-container">
                     <div className="comments-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                      <div>
-                        <h3>Collected Comments ({rawComments.length})</h3>
+                      <div className="tab-header">
+                        <h3>Collected Comments ({videoData.processed_comments || rawComments.length})</h3>
                         <p>Raw data and AI structured analysis for each comment.</p>
                       </div>
                       <a 
@@ -642,12 +720,43 @@ function App() {
                           </div>
                         ))}
                         
-                        {hasMoreComments && (
-                          <button className="btn-load-more" onClick={handleLoadMore}>
-                            Load More Comments
+                      <div className="pagination-controls">
+                        <div className="pagination-left">
+                          <label>Items per page:</label>
+                          <select 
+                            value={commentLimit} 
+                            onChange={(e) => {
+                              setCommentLimit(Number(e.target.value));
+                              setCurrentPage(1);
+                            }}
+                          >
+                            <option value={10}>10</option>
+                            <option value={15}>15</option>
+                            <option value={30}>30</option>
+                            <option value={50}>50</option>
+                          </select>
+                        </div>
+                        <div className="pagination-right">
+                          <button 
+                            className="btn-pagination"
+                            disabled={currentPage === 1}
+                            onClick={() => setCurrentPage(p => Math.max(1, p - 1))}
+                          >
+                            Previous
                           </button>
-                        )}
+                          <span className="pagination-info">
+                            Page {currentPage} of {Math.ceil((videoData.processed_comments || 0) / commentLimit) || 1}
+                          </span>
+                          <button 
+                            className="btn-pagination"
+                            disabled={currentPage >= Math.ceil((videoData.processed_comments || 0) / commentLimit)}
+                            onClick={() => setCurrentPage(p => p + 1)}
+                          >
+                            Next
+                          </button>
+                        </div>
                       </div>
+                    </div>
                     )}
                   </div>
                 )}

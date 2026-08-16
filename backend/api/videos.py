@@ -24,6 +24,9 @@ from services.youtube import YouTubeService, extract_video_id
 
 router = APIRouter(prefix="/api/videos", tags=["videos"])
 
+# Global set to track cancelled tasks
+cancellation_tokens = set()
+
 
 class ProcessVideoRequest(BaseModel):
     url: str
@@ -43,15 +46,15 @@ async def add_log(db: AsyncSession, video_id: int, message: str, level: str = "I
 async def process_video_background(video_id: int, youtube_id: str, limit: int):
     async with async_session() as db:
         try:
-            await add_log(
-                db, video_id, f"Started processing video: {youtube_id}", "INFO"
-            )
-
             video = await db.get(Video, video_id)
             if not video:
                 return
             video.analysis_status = "collecting"
             await db.commit()
+
+            await add_log(
+                db, video_id, f"Started processing video: {video.title}", "INFO"
+            )
 
             # 1. Fetch Comments
             limit_str = "All" if limit >= 99999 else str(limit)
@@ -113,6 +116,16 @@ async def process_video_background(video_id: int, youtube_id: str, limit: int):
             batch_size = nlp_service.batch_size
 
             for i in range(0, len(comments_data), batch_size):
+                if video_id in cancellation_tokens:
+                    await add_log(
+                        db, video_id, "Process cancelled by user. Cleaning up...", "WARNING"
+                    )
+                    # Delete the video from DB (which cascades to comments, analysis, logs)
+                    await db.delete(video)
+                    await db.commit()
+                    cancellation_tokens.remove(video_id)
+                    return
+
                 chunk = comments_data[i : i + batch_size]
 
                 # Spam Detection Logic (Regex for URLs, or repeating words)
@@ -310,6 +323,19 @@ async def reset_database(db: AsyncSession = Depends(get_db)):
         await db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
 
+
+
+@router.post("/{video_id}/cancel")
+async def cancel_video_processing(video_id: int, db: AsyncSession = Depends(get_db)):
+    video = await db.get(Video, video_id)
+    if not video:
+        raise HTTPException(status_code=404, detail="Video not found")
+        
+    if video.analysis_status in ["completed", "failed"]:
+        raise HTTPException(status_code=400, detail="Cannot cancel a completed or failed process")
+        
+    cancellation_tokens.add(video_id)
+    return {"status": "success", "message": "Cancellation requested"}
 
 
 @router.get("/{video_id}")
@@ -512,8 +538,17 @@ async def chat_video(
     retrieval_service = RetrievalService(db)
     chat_service = ChatService()
 
+    from sqlalchemy import func
+    
+    stmt_count = select(func.count(Comment.id)).where(Comment.video_id == video_id, Comment.is_spam == False)
+    total_comments = (await db.execute(stmt_count)).scalar() or 0
+    
+    # Send 25% of relevant comments to AI, but cap at 100 to prevent rate limits or context bloat
+    dynamic_limit = max(20, int(total_comments * 0.25))
+    dynamic_limit = min(dynamic_limit, 100)
+
     retrieved_comments = await retrieval_service.search_similar_comments(
-        video_id, request.question, limit=20
+        video_id, request.question, limit=dynamic_limit
     )
     answer = chat_service.ask_question(request.question, retrieved_comments)
 

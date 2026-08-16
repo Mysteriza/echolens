@@ -119,10 +119,15 @@ def main():
             time.sleep(1)
     except KeyboardInterrupt:
         print("\nShutting down servers...")
-        backend_process.terminate()
-        frontend_process.terminate()
-        backend_process.wait()
-        frontend_process.wait()
+        if os.name == 'nt':
+            # Kill process tree on Windows to prevent orphaned node/uvicorn background processes
+            subprocess.run(['taskkill', '/F', '/T', '/PID', str(backend_process.pid)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(['taskkill', '/F', '/T', '/PID', str(frontend_process.pid)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            backend_process.terminate()
+            frontend_process.terminate()
+            backend_process.wait()
+            frontend_process.wait()
         print("All servers stopped gracefully.")
 
 if __name__ == "__main__":

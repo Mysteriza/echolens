@@ -60,13 +60,35 @@ class IndoBERTService:
         print("Loading IndoBERT Model... (This may take a moment)")
         model_name = "w11wo/indonesian-roberta-base-sentiment-classifier"
 
-        self.classifier = pipeline(
-            "sentiment-analysis",
-            model=model_name,
-            device=self.device_id,
-            truncation=True,
-            max_length=512,
-        )
+        if self.device_id == -1:
+            from transformers import AutoModelForSequenceClassification, AutoTokenizer
+            import torch
+            
+            print("Applying Dynamic Quantization (INT8) for faster CPU inference...")
+            tokenizer = AutoTokenizer.from_pretrained(model_name)
+            model = AutoModelForSequenceClassification.from_pretrained(model_name)
+            
+            # Compress Linear layers to INT8 for ~2x speedup on CPU
+            quantized_model = torch.quantization.quantize_dynamic(
+                model, {torch.nn.Linear}, dtype=torch.qint8
+            )
+            
+            self.classifier = pipeline(
+                "sentiment-analysis",
+                model=quantized_model,
+                tokenizer=tokenizer,
+                device=-1,
+                truncation=True,
+                max_length=512,
+            )
+        else:
+            self.classifier = pipeline(
+                "sentiment-analysis",
+                model=model_name,
+                device=self.device_id,
+                truncation=True,
+                max_length=512,
+            )
         print("IndoBERT Model Loaded Successfully!")
 
 
