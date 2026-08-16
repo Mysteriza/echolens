@@ -300,6 +300,17 @@ async def process_video(
         "status": "pending",
     }
 
+@router.post("/reset-database")
+async def reset_database(db: AsyncSession = Depends(get_db)):
+    try:
+        await db.execute(text("TRUNCATE TABLE videos CASCADE"))
+        await db.commit()
+        return {"status": "success", "message": "Database reset successful."}
+    except Exception as e:
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 
 @router.get("/{video_id}")
 async def get_video(video_id: int, db: AsyncSession = Depends(get_db)):

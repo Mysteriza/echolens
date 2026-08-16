@@ -49,7 +49,11 @@ app.add_middleware(
 
 @app.get("/health")
 async def health_check():
-    return {"status": "ok"}
+    from core.config import settings
+    return {
+        "status": "ok",
+        "gemini_enabled": bool(settings.GEMINI_API_KEY.strip())
+    }
 
 
 if __name__ == "__main__":

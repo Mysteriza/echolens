@@ -35,8 +35,20 @@ function App() {
   const [status, setStatus] = useState<string>('')
   const [videoData, setVideoData] = useState<VideoMetadata>({})
   
-  const [question, setQuestion] = useState('')
-  const [chatHistory, setChatHistory] = useState<any[]>([])
+  const [geminiEnabled, setGeminiEnabled] = useState(true)
+  
+  useEffect(() => {
+    fetch('http://localhost:8000/health')
+      .then(res => res.json())
+      .then(data => {
+        setGeminiEnabled(data.gemini_enabled)
+        // If chat was active and gemini is disabled, switch to analytics
+        if (!data.gemini_enabled && activeTab === 'chat') {
+          setActiveTab('analytics')
+        }
+      })
+      .catch(e => console.error("Failed to fetch health check", e))
+  }, [])
   
   const [loading, setLoading] = useState(false)
   const [asking, setAsking] = useState(false)
@@ -183,6 +195,33 @@ function App() {
     }
   }
 
+  const handleNewAnalysis = () => {
+    setVideoId(null)
+    setUrl('')
+    setStats(null)
+    setRawComments([])
+    setLogs([])
+    setActiveTab('chat')
+  }
+
+  const handleResetDatabase = async () => {
+    if (window.confirm("Are you sure you want to delete ALL analyzed data? This action cannot be undone.")) {
+      if (window.confirm("FINAL WARNING: All YouTube videos and comments data in the database will be permanently wiped. Proceed?")) {
+        try {
+          const res = await fetch('http://localhost:8000/api/videos/reset-database', { method: 'POST' })
+          if (res.ok) {
+            alert("Database has been reset successfully.")
+            window.location.reload()
+          } else {
+            alert("Failed to reset database.")
+          }
+        } catch (e) {
+          alert("Error connecting to server.")
+        }
+      }
+    }
+  }
+
   const handleLoadMore = () => {
     if (videoId) {
       fetchComments(videoId, commentSkip + COMMENT_LIMIT, true)
@@ -256,56 +295,79 @@ function App() {
 
       <main className="main-content">
         {!videoId ? (
-          <div className="hero-section">
-            <div className="hero-text">
-              <h1>Understand what consumers actually think.</h1>
-              <p>Paste a YouTube URL to extract, analyze, and query hundreds of comments instantly using AI.</p>
-            </div>
-            <form className="hero-form" onSubmit={handleProcess}>
-              <div className="input-wrapper">
-                <svg className="search-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M22.54 6.42a2.78 2.78 0 0 0-1.94-2C18.88 4 12 4 12 4s-6.88 0-8.6.46a2.78 2.78 0 0 0-1.94 2A29 29 0 0 0 1 11.75a29 29 0 0 0 .46 5.33 2.78 2.78 0 0 0 1.94 2c1.72.46 8.6.46 8.6.46s6.88 0 8.6-.46a2.78 2.78 0 0 0 1.94-2 29 29 0 0 0 .46-5.33 29 29 0 0 0-.46-5.33z"></path><polygon points="9.75 15.02 15.5 11.75 9.75 8.48 9.75 15.02"></polygon></svg>
-                <input 
-                  type="text" 
-                  className="url-input"
-                  placeholder="https://www.youtube.com/watch?v=..." 
-                  value={url}
-                  onChange={e => setUrl(e.target.value)}
-                  disabled={loading}
-                  autoFocus
-                />
-                <button type="submit" className="btn-analyze" disabled={!url || loading}>
-                  {loading ? 'Starting...' : 'Analyze Video'}
-                </button>
-              </div>
-              
-              <div className="limit-selector-custom">
-                <span className="limit-label">Analyze Comments:</span>
-                <div className="dropdown-container">
-                  <div 
-                    className="dropdown-trigger" 
-                    onClick={() => !loading && setShowDropdown(!showDropdown)}
-                    style={{ opacity: loading ? 0.5 : 1, cursor: loading ? 'not-allowed' : 'pointer' }}
-                  >
-                    {limitOptions.find(o => o.value === limit)?.label}
-                    <svg className="dropdown-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="6 9 12 15 18 9"></polyline></svg>
+          <div className="hero">
+            <h1>Understand what consumers actually think.</h1>
+            <p className="subtitle">
+              Paste a YouTube URL to extract, analyze, and query hundreds of comments instantly using AI.
+            </p>
+            
+            <form onSubmit={handleProcess} className="hero-form">
+              <div className="input-row">
+                <div className="input-wrapper">
+                  <svg className="youtube-icon" viewBox="0 0 24 24" fill="currentColor"><path d="M23.498 6.186a3.016 3.016 0 0 0-2.122-2.136C19.505 3.545 12 3.545 12 3.545s-7.505 0-9.377.505A3.017 3.017 0 0 0 .502 6.186C0 8.07 0 12 0 12s0 3.93.502 5.814a3.016 3.016 0 0 0 2.122 2.136c1.871.505 9.376.505 9.376.505s7.505 0 9.377-.505a3.015 3.015 0 0 0 2.122-2.136C24 15.93 24 12 24 12s0-3.93-.502-5.814zM9.545 15.568V8.432L15.818 12l-6.273 3.568z"/></svg>
+                  <input 
+                    type="text" 
+                    placeholder="https://www.youtube.com/watch?v=..." 
+                    value={url}
+                    onChange={e => setUrl(e.target.value)}
+                    disabled={loading}
+                    autoFocus
+                  />
+                </div>
+                
+                <div className="limit-selector-custom" style={{ width: '200px' }}>
+                  <div className="dropdown-container">
+                    <div 
+                      className="dropdown-trigger" 
+                      onClick={() => !loading && setShowDropdown(!showDropdown)}
+                      style={{ opacity: loading ? 0.5 : 1, cursor: loading ? 'not-allowed' : 'pointer', height: '100%', border: 'none', borderLeft: '1px solid #E5E7EB', borderRadius: '0 50px 50px 0', backgroundColor: '#F9FAFB' }}
+                    >
+                      <span>Analyze: {limitOptions.find(o => o.value === limit)?.label}</span>
+                      <svg className="dropdown-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="6 9 12 15 18 9"></polyline></svg>
+                    </div>
+                    
+                    {showDropdown && (
+                      <ul className="dropdown-menu">
+                        {limitOptions.map(opt => (
+                          <li 
+                            key={opt.value} 
+                            onClick={() => { setLimit(opt.value); setShowDropdown(false); }}
+                            className={limit === opt.value ? 'selected' : ''}
+                          >
+                            {opt.label}
+                          </li>
+                        ))}
+                      </ul>
+                    )}
                   </div>
-                  
-                  {showDropdown && (
-                    <ul className="dropdown-menu">
-                      {limitOptions.map(opt => (
-                        <li 
-                          key={opt.value} 
-                          onClick={() => { setLimit(opt.value); setShowDropdown(false); }}
-                          className={limit === opt.value ? 'selected' : ''}
-                        >
-                          {opt.label}
-                        </li>
-                      ))}
-                    </ul>
-                  )}
                 </div>
               </div>
+              
+              <button type="submit" className="btn-analyze-large" disabled={!url || loading}>
+                {loading ? 'Starting...' : 'Analyze Video'}
+              </button>
             </form>
+            
+            <div className="hero-about">
+              <h3>How Echolens Works</h3>
+              <div className="about-grid">
+                <div className="about-card">
+                  <div className="about-icon">1</div>
+                  <h4>Extract</h4>
+                  <p>Fetches comments directly from the YouTube API instantly.</p>
+                </div>
+                <div className="about-card">
+                  <div className="about-icon">2</div>
+                  <h4>Analyze</h4>
+                  <p>Classifies sentiments and identifies complaints using IndoBERT AI.</p>
+                </div>
+                <div className="about-card">
+                  <div className="about-icon">3</div>
+                  <h4>Chat</h4>
+                  <p>Query the data and talk to the consumer insights via Gemini AI.</p>
+                </div>
+              </div>
+            </div>
           </div>
         ) : (
           <div className="dashboard">
@@ -329,6 +391,14 @@ function App() {
                 <h4>How it works</h4>
                 <p>Echolens is currently analyzing each comment using AI to extract sentiment and complaints. Once ready, you can ask specific questions about the consumer opinions.</p>
               </div>
+              <div className="sidebar-actions">
+                <button className="btn-sidebar-action new-analysis" onClick={handleNewAnalysis}>
+                  + New Analysis
+                </button>
+                <button className="btn-sidebar-action reset-db" onClick={handleResetDatabase}>
+                  Reset Database
+                </button>
+              </div>
             </aside>
 
             <section className="main-panel">
@@ -339,17 +409,14 @@ function App() {
                 >
                   Analytics
                 </button>
-                <button 
-                  className={`tab-btn ${activeTab === 'compare' ? 'active' : ''}`}
-                  onClick={() => setActiveTab('compare')}
-                >
-                  Compare (VS)
-                </button>
+
                 <button 
                   className={`tab-btn ${activeTab === 'chat' ? 'active' : ''}`}
-                  onClick={() => setActiveTab('chat')}
+                  onClick={() => geminiEnabled && setActiveTab('chat')}
+                  style={{ opacity: geminiEnabled ? 1 : 0.5, cursor: geminiEnabled ? 'pointer' : 'not-allowed' }}
+                  title={!geminiEnabled ? 'Google AI API key is not configured' : ''}
                 >
-                  AI Chat
+                  AI Chat {!geminiEnabled && '(Disabled)'}
                 </button>
                 <button 
                   className={`tab-btn ${activeTab === 'comments' ? 'active' : ''}`}
@@ -432,57 +499,51 @@ function App() {
                 )}
 
 
-                {activeTab === 'chat' && (
+                {activeTab === 'chat' && geminiEnabled && (
                   <div className="chat-container">
-
                     <div className="chat-history">
                       {chatHistory.length === 0 ? (
                         <div className="empty-chat">
-                          <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="var(--border-strong)" strokeWidth="1" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path></svg>
-                          <h3>Ask about the opinions</h3>
-                          <p>Try asking: "What is the main complaint about the battery?" or "Do people think this is worth the price?"</p>
+                          <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" style={{color: 'var(--text-tertiary)'}}><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path></svg>
+                          <h3>Ask Echolens AI</h3>
+                          <p>Ask anything about the consumer opinions, complaints, or sentiments from this video.</p>
                         </div>
                       ) : (
-                        chatHistory.map((msg, idx) => (
-                          <div key={idx} className={`message-wrapper ${msg.type}`}>
-                            {msg.type === 'question' && (
-                              <div className="message user-message">{msg.content}</div>
-                            )}
-                            
-                            {msg.type === 'error' && (
-                              <div className="message error-message">{msg.content}</div>
-                            )}
-                            
-                            {msg.type === 'answer' && (
-                              <div className="message ai-message">
+                        chatHistory.map((msg, i) => (
+                          <div key={i} className={`message-wrapper ${msg.type}`}>
+                            {msg.type === 'question' ? (
+                              <div className="user-message">{msg.content}</div>
+                            ) : (
+                              <div className="ai-message">
                                 <div className="ai-answer-header">
                                   <span className="ai-label">AI Analysis</span>
-                                  <span className={`confidence-pill ${msg.data.confidence?.toLowerCase()}`}>
-                                    {msg.data.confidence} Confidence
+                                  <span className={`confidence-pill ${msg.content.confidence.toLowerCase()}`}>
+                                    {msg.content.confidence} Confidence
                                   </span>
                                 </div>
+                                <div className="ai-text">{msg.content.answer}</div>
                                 
-                                <p className="ai-text">{msg.data.answer}</p>
-                                
-                                {msg.data.relevant_aspects?.length > 0 && (
+                                {msg.content.relevant_aspects && msg.content.relevant_aspects.length > 0 && (
                                   <div className="ai-aspects">
-                                    {msg.data.relevant_aspects.map((asp: string, i: number) => (
-                                      <span key={i} className="aspect-pill">{asp}</span>
+                                    {msg.content.relevant_aspects.map((asp: string, j: number) => (
+                                      <span key={j} className="aspect-pill">{asp}</span>
                                     ))}
                                   </div>
                                 )}
                                 
-                                {msg.data.evidence?.length > 0 && (
+                                {msg.content.supporting_evidence && msg.content.supporting_evidence.length > 0 && (
                                   <div className="evidence-section">
-                                    <h5 className="evidence-title">Sources from Comments:</h5>
+                                    <div className="evidence-title">Sources from Comments:</div>
                                     <div className="evidence-grid">
-                                      {msg.data.evidence.map((c: any) => (
-                                        <div key={c.id} className="evidence-item">
+                                      {msg.content.supporting_evidence.map((ev: any, j: number) => (
+                                        <div key={j} className="evidence-item">
                                           <div className="evidence-item-header">
-                                            <span className="evidence-author">@{c.author}</span>
-                                            <span className={`evidence-sentiment ${c.sentiment}`}>{c.sentiment}</span>
+                                            <span className="evidence-author">{ev.author}</span>
+                                            <span className={`evidence-sentiment ${ev.sentiment.toLowerCase()}`}>
+                                              {ev.sentiment}
+                                            </span>
                                           </div>
-                                          <p className="evidence-quote">"{c.text}"</p>
+                                          <div className="evidence-quote">"{ev.text}"</div>
                                         </div>
                                       ))}
                                     </div>
@@ -493,36 +554,52 @@ function App() {
                           </div>
                         ))
                       )}
+                      
                       {asking && (
                         <div className="message-wrapper answer">
-                          <div className="message ai-message loading-message">
-                            <span className="loading-dot"></span>
-                            <span className="loading-dot"></span>
-                            <span className="loading-dot"></span>
+                          <div className="ai-message">
+                            <div className="loading-message">
+                              <div className="loading-dot"></div>
+                              <div className="loading-dot"></div>
+                              <div className="loading-dot"></div>
+                              <span style={{marginLeft: '8px', color: 'var(--text-secondary)', fontSize: '0.875rem'}}>AI is analyzing comments...</span>
+                            </div>
                           </div>
                         </div>
                       )}
                       <div ref={chatEndRef} />
                     </div>
-
+                    
                     <div className="chat-input-container">
-                      <form className="chat-form" onSubmit={handleAsk}>
-                        <input 
-                          type="text" 
+                      <form onSubmit={handleAsk} className="chat-form">
+                        <textarea
                           className="chat-input"
-                          placeholder={status !== 'completed' ? 'Wait for analysis to complete...' : 'Ask a question about the comments...'} 
+                          placeholder="Ask a question about the comments..."
                           value={question}
                           onChange={e => setQuestion(e.target.value)}
-                          disabled={status !== 'completed' || asking}
+                          onKeyDown={e => {
+                            if (e.key === 'Enter' && !e.shiftKey) {
+                              e.preventDefault()
+                              handleAsk(e)
+                            }
+                          }}
+                          rows={2}
+                          disabled={asking}
                         />
-                        <button 
-                          type="submit" 
-                          className="chat-submit-btn"
-                          disabled={status !== 'completed' || asking || !question.trim()}
-                        >
+                        <button type="submit" className="chat-submit-btn" disabled={!question.trim() || asking}>
                           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="22" y1="2" x2="11" y2="13"></line><polygon points="22 2 15 22 11 13 2 9 22 2"></polygon></svg>
                         </button>
                       </form>
+                    </div>
+                  </div>
+                )}
+                
+                {activeTab === 'chat' && !geminiEnabled && (
+                  <div className="chat-container">
+                    <div className="empty-chat" style={{ marginTop: '4rem' }}>
+                      <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" style={{color: 'var(--text-tertiary)'}}><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path></svg>
+                      <h3>AI Chat is Disabled</h3>
+                      <p>The Google AI API key has not been configured in the backend environment variables. The overall sentiment analysis continues to function normally.</p>
                     </div>
                   </div>
                 )}
