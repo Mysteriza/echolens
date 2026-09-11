@@ -1,4 +1,3 @@
-from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
     Boolean,
     Column,
@@ -27,6 +26,9 @@ class Video(Base):
     analysis_status = Column(
         String, default="pending"
     )  # pending, collecting, analyzing, completed, failed
+    # User-adjustable chat context preference (NULL = server default).
+    chat_context_limit = Column(Integer, nullable=True)
+    chat_context_fraction = Column(Float, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
@@ -57,15 +59,6 @@ class Comment(Base):
         uselist=False,
         cascade="all, delete-orphan",
     )
-    aspects = relationship(
-        "CommentAspect", back_populates="comment", cascade="all, delete-orphan"
-    )
-    embedding = relationship(
-        "CommentEmbedding",
-        back_populates="comment",
-        uselist=False,
-        cascade="all, delete-orphan",
-    )
 
 
 class CommentAnalysis(Base):
@@ -87,27 +80,6 @@ class CommentAnalysis(Base):
     comment = relationship("Comment", back_populates="analysis")
 
 
-class CommentAspect(Base):
-    __tablename__ = "comment_aspects"
-
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    comment_id = Column(Integer, ForeignKey("comments.id"), nullable=False)
-    aspect = Column(String, index=True, nullable=False)
-    sentiment = Column(String)  # positive, neutral, negative
-
-    comment = relationship("Comment", back_populates="aspects")
-
-
-class CommentEmbedding(Base):
-    __tablename__ = "comment_embeddings"
-
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    comment_id = Column(Integer, ForeignKey("comments.id"), unique=True, nullable=False)
-    embedding = Column(Vector(768))  # 768 dimensions for Gemini embeddings
-
-    comment = relationship("Comment", back_populates="embedding")
-
-
 class VideoLog(Base):
     __tablename__ = "video_logs"
 
@@ -118,15 +90,3 @@ class VideoLog(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
-class VideoReport(Base):
-    __tablename__ = "video_reports"
-
-    id = Column(Integer, primary_key=True, index=True)
-    video_id = Column(
-        Integer, ForeignKey("videos.id", ondelete="CASCADE"), index=True, unique=True
-    )
-    overall_sentiment = Column(String(50))
-    summary = Column(Text)
-    top_complaints = Column(Text)  # Stored as JSON string or text bullet points
-    top_praises = Column(Text)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())

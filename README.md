@@ -14,7 +14,7 @@ Pernahkah Anda melihat video YouTube dengan puluhan ribu komentar dan penasaran 
 ### Fitur Utama
 1. **Official YouTube API Fetching**: Mengambil (*fetching*) ratusan hingga ribuan komentar video secara resmi, legal, dan aman menggunakan API resmi YouTube Data v3. (Bukan sekadar metode *scraping* ilegal).
 2. **Local Sentiment Analysis (IndoBERT)**: Memproses sentimen audiens (Positif, Negatif, Netral) menggunakan model AI lokal dengan teknik *Hardware-Aware Batching*. Sistem akan mendeteksi apakah komputer Anda menggunakan CPU biasa atau GPU berat, lalu menyesuaikan kecepatan bacanya secara otomatis tanpa menyedot biaya API pihak ketiga!
-3. **Contextual AI Chat (RAG)**: Anda bisa bertanya langsung kepada kumpulan komentar tersebut. Contoh: *"Apa keluhan utama netizen soal performa gaming HP ini?"* AI Gemini tidak akan menebak-nebak, melainkan akan membaca bukti nyata dari 20 komentar paling relevan di *database*, merangkumnya untuk Anda, dan melampirkan dari mana sumber komentarnya.
+3. **Contextual AI Chat (RAG)**: Anda bisa bertanya langsung kepada kumpulan komentar tersebut. Contoh: *"Apa keluhan utama netizen soal performa gaming HP ini?"* AI Gemini tidak akan menebak-nebak, melainkan akan membaca bukti nyata dari komentar paling relevan di *database* (default 25% komentar, bisa diatur 5–100 lewat UI Settings), merangkumnya untuk Anda, dan melampirkan dari mana sumber komentarnya.
 4. **Supabase PostgreSQL**: Echolens menggunakan [Supabase](https://supabase.com) (platform *open-source* alternatif Firebase) sebagai sistem *database* PostgreSQL *cloud* yang super cepat, aman, dan gratis.
 5. **Dashboard Modern**: Tampilan antarmuka (UI) yang bersih, profesional, asinkron, dan sangat responsif, dikembangkan dengan React & Vite.
 
@@ -65,8 +65,8 @@ venv\Scripts\activate   # (Ketik ini jika menggunakan Windows)
 source venv/bin/activate # (Ketik ini jika menggunakan Mac/Linux)
 
 pip install -r requirements.txt
-alembic upgrade head
 ```
+*Catatan: tabel dibuat otomatis saat backend pertama dijalankan (`init_db`). Tidak ada migrasi Alembic yang perlu dijalankan manual.*
 
 **Langkah 4: Konfigurasi Frontend (Tampilan Web)**
 Buka terminal baru (biarkan terminal *backend* Anda yang sebelumnya tetap terbuka), arahkan ke folder `frontend`, dan instal kebutuhannya:
@@ -78,9 +78,22 @@ npm install
 **Langkah 5: Menjalankan Aplikasi Echolens**
 Kembali ke folder utama `echolens` di terminal, lalu jalankan perintah penjalan otomatis ini:
 ```bash
-python run.py
+python run.py            # hanya menjalankan (tanpa install ulang)
+python run.py --setup    # install/update dependencies backend+frontend lalu jalan
+python run.py --skip-checks  # lewati validasi .env
 ```
 Sistem akan otomatis menghidupkan *backend* API dan *frontend* antarmuka Anda. Sekarang, buka *browser* kesayangan Anda (Google Chrome / Edge) dan kunjungi: **http://localhost:5173**. Selamat menikmati Echolens!
+
+### Mengatur Batasan (Limits)
+Semua limit bisa diubah user lewat UI **⚙ Settings** (header) atau tab **Settings** per video. Setiap setting punya ikon ⓘ (huruf "i") — arahkan kursor atau fokus keyboard untuk melihat penjelasan maksud dan tujuannya:
+- **Fetch limit**: jumlah komentar YouTube yang diambil per analisis. Makin besar makin lengkap tapi makin lama dan boros kuota API. Opsi "All" mengambil sampai batas server (`MAX_PROCESS_LIMIT`, default 2000).
+- **Custom AI context** (checkbox): aktifkan untuk mengatur sendiri konteks AI. Jika mati, server memakai default (25% komentar, min 20, max 100).
+- **Chat context**: jumlah komentar teratas (berdasarkan likes, non-spam) yang dibaca AI untuk menjawab tiap pertanyaan. Lebih besar = jawaban lebih kaya tapi lebih lambat dan boros kuota Gemini.
+- **Context fraction**: alternatif otomatis — ambil sekian persen dari total komentar sebagai konteks AI (dipakai saat chat context tidak diisi manual).
+- **Comments per page**: jumlah komentar per halaman di tab Raw Comments. Murni tampilan, tidak memengaruhi analisis.
+- **Admin token**: kata sandi khusus tombol Reset Database (header `X-Admin-Token`). Wajib jika server mengatur `ADMIN_TOKEN` di `.env`.
+- Base URL API frontend: `VITE_API_URL` (lihat `frontend/.env.example`).
+- Server caps di `.env`: `MAX_PROCESS_LIMIT`, `MAX_COMMENT_PAGE_SIZE`, `MAX_CHAT_CONTEXT`, `MAX_QUESTION_LENGTH`, `CHAT_CONTEXT_FRACTION`, `CHAT_CONTEXT_MIN`, `ADMIN_TOKEN`, `CORS_ORIGINS`.
 
 ---
 
@@ -94,7 +107,7 @@ Have you ever seen a YouTube video with tens of thousands of comments and wonder
 ### Key Features
 1. **Official YouTube API Fetching**: Securely and legally fetches hundreds to thousands of video comments using the official YouTube Data v3 API. (This is clean API fetching, not unregulated scraping).
 2. **Local Sentiment Analysis (IndoBERT)**: Processes audience sentiment (Positive, Negative, Neutral) using a local AI model backed by a *Hardware-Aware Batching* technique. The system detects whether your machine uses a standard CPU or a heavy GPU, automatically adjusting the processing speed without racking up third-party API costs!
-3. **Contextual AI Chat (RAG)**: Ask questions directly to the comment pool. Example: *"What is the main netizen complaint regarding this phone's gaming performance?"* The Gemini AI won't guess; instead, it will read the factual evidence from the 20 most relevant comments in the database, summarize them for you, and cite the exact comment sources.
+3. **Contextual AI Chat (RAG)**: Ask questions directly to the comment pool. Example: *"What is the main netizen complaint regarding this phone's gaming performance?"* The Gemini AI won't guess; instead, it will read the factual evidence from the most relevant comments in the database (25% of comments by default, adjustable 5–100 in the Settings UI), summarize them for you, and cite the exact comment sources.
 4. **Supabase PostgreSQL**: Echolens utilizes [Supabase](https://supabase.com) (an open-source Firebase alternative) as a lightning-fast, secure, and free cloud PostgreSQL database system.
 5. **Modern Dashboard**: A clean, professional, asynchronous, and highly responsive user interface built using React & Vite.
 
@@ -145,8 +158,8 @@ venv\Scripts\activate   # (Type this if using Windows)
 source venv/bin/activate # (Type this if using Mac/Linux)
 
 pip install -r requirements.txt
-alembic upgrade head
 ```
+*Note: tables are created automatically on first backend run (`init_db`). No manual Alembic migration is needed. If Supabase is unreachable, the backend automatically falls back to a local SQLite file (`backend/echolens_local.db`) so the app always runs.*
 
 **Step 4: Frontend Configuration (Web Interface)**
 Open a new terminal window (keep your previous backend terminal open), navigate to the `frontend` folder, and install the dependencies:
@@ -158,6 +171,19 @@ npm install
 **Step 5: Running Echolens**
 Return to the main `echolens` folder in your terminal, and execute this auto-runner script:
 ```bash
-python run.py
+python run.py            # just run (no reinstall)
+python run.py --setup    # install/update backend+frontend deps, then run
+python run.py --skip-checks  # skip .env validation
 ```
 The system will automatically boot up both the API backend and your frontend interface. Now, open your favorite browser (Google Chrome / Edge) and visit: **http://localhost:5173**. Enjoy using Echolens!
+
+### Configuring Limits (Settings)
+All limits are user-adjustable via the **⚙ Settings** UI (header) or the per-video **Settings** tab. Every setting has an ⓘ ("i") icon — hover or keyboard-focus it to see a plain explanation of its purpose:
+- **Fetch limit**: how many YouTube comments are fetched per analysis. Larger is more complete but slower and uses more API quota. "All" fetches up to the server cap (`MAX_PROCESS_LIMIT`, default 2000).
+- **Custom AI context** (checkbox): enable to set the AI context yourself. When off, the server uses its default (25% of comments, min 20, max 100).
+- **Chat context**: how many top (most-liked, non-spam) comments the AI reads to answer each question. Larger = richer answers but slower and more Gemini quota.
+- **Context fraction**: automatic alternative — take this percent of total comments as AI context (used when chat context is not set manually).
+- **Comments per page**: comments shown per page in the Raw Comments tab. Display only, does not affect analysis.
+- **Admin token**: special password for the Reset Database button (sent as `X-Admin-Token` header). Required when the server sets `ADMIN_TOKEN` in `.env`.
+- Frontend API base URL: `VITE_API_URL` (see `frontend/.env.example`).
+- Server caps in `.env`: `MAX_PROCESS_LIMIT`, `MAX_COMMENT_PAGE_SIZE`, `MAX_CHAT_CONTEXT`, `MAX_QUESTION_LENGTH`, `CHAT_CONTEXT_FRACTION`, `CHAT_CONTEXT_MIN`, `ADMIN_TOKEN`, `CORS_ORIGINS`.

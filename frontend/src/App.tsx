@@ -1,12 +1,37 @@
-import { useState, useRef, useEffect } from 'react'
+import { useState, useRef, useEffect, useCallback } from 'react'
 import { PieChart, Pie, Cell, Tooltip, ResponsiveContainer, LineChart, Line, XAxis, YAxis, CartesianGrid, Legend } from 'recharts'
 import './App.css'
+
+const API_BASE = (import.meta.env.VITE_API_URL as string || 'http://localhost:8000').replace(/\/$/, '')
+const FETCH_ALL_SENTINEL = 99999
+
+interface ServerCaps {
+  gemini_enabled: boolean;
+  max_process_limit: number;
+  max_comment_page_size: number;
+  max_chat_context: number;
+  max_question_length: number;
+  chat_context_fraction: number;
+  chat_context_min: number;
+}
+
+const DEFAULT_CAPS: ServerCaps = {
+  gemini_enabled: true,
+  max_process_limit: 2000,
+  max_comment_page_size: 100,
+  max_chat_context: 100,
+  max_question_length: 1000,
+  chat_context_fraction: 0.25,
+  chat_context_min: 20,
+}
 
 interface VideoMetadata {
   title?: string;
   channel?: string;
   thumbnail?: string;
   processed_comments?: number;
+  chat_context_limit?: number | null;
+  chat_context_fraction?: number | null;
 }
 
 interface LogEntry {
@@ -23,43 +48,95 @@ interface RawComment {
   is_spam: boolean;
   sentiment: string;
   confidence: number;
-  summary: string;
   is_complaint: boolean;
   is_praise: boolean;
 }
 
+interface SentimentSlice { name: string; value: number }
+interface TimelinePoint { date: string; positive: number; negative: number; neutral: number }
+interface TopWord { text: string; value: number }
+interface VideoStats {
+  total_comments: number;
+  sentiment_distribution: SentimentSlice[];
+  timeline: TimelinePoint[];
+  top_words: TopWord[];
+}
+
+interface ChatEvidence {
+  id: number;
+  author: string;
+  text: string;
+  sentiment: string;
+}
+
+interface ChatAnswer {
+  answer: string;
+  confidence: string;
+  relevant_aspects: string[];
+  evidence: ChatEvidence[];
+  context_used?: number;
+  context_limit?: number;
+}
+
+type ChatMessage =
+  | { type: 'question'; content: string }
+  | { type: 'answer'; content: ChatAnswer }
+  | { type: 'error'; content: string }
+
+/** Small "i" badge with a hover/focus tooltip explaining a setting. */
+function InfoTip({ text }: { text: string }) {
+  return (
+    <span className="info-tip" data-tip={text} tabIndex={0} aria-label={text}>
+      i
+    </span>
+  );
+}
+
 function App() {
   const [url, setUrl] = useState('')
-  const [limit, setLimit] = useState(99999)
+  const [limit, setLimit] = useState(300)
   const [videoId, setVideoId] = useState<number | null>(null)
   const [status, setStatus] = useState<string>('')
   const [videoData, setVideoData] = useState<VideoMetadata>({})
-  
-  const [geminiEnabled, setGeminiEnabled] = useState(true)
-  
+
+  const [caps, setCaps] = useState<ServerCaps>(DEFAULT_CAPS)
+  const geminiEnabled = caps.gemini_enabled
+
+  // User-adjustable limits (clamped to server caps from /api/settings).
+  const [chatContextLimit, setChatContextLimit] = useState<number>(50)
+  const [chatContextFraction, setChatContextFraction] = useState<number>(0.25)
+  const [useCustomChatContext, setUseCustomChatContext] = useState(false)
+  const [adminToken, setAdminToken] = useState('')
+  const [showSettings, setShowSettings] = useState(false)
 
   const [loading, setLoading] = useState(false)
   const [asking, setAsking] = useState(false)
-  
-  const [activeTab, setActiveTab] = useState<'chat' | 'comments' | 'analytics' | 'logs'>('chat')
+
+  const [activeTab, setActiveTab] = useState<'chat' | 'comments' | 'analytics' | 'logs' | 'settings'>('chat')
   const [logs, setLogs] = useState<LogEntry[]>([])
   const [rawComments, setRawComments] = useState<RawComment[]>([])
-  const [stats, setStats] = useState<any>(null)
-  
-  const [question, setQuestion] = useState('')
-  const [chatHistory, setChatHistory] = useState<any[]>([])
+  const [stats, setStats] = useState<VideoStats | null>(null)
 
+  const [question, setQuestion] = useState('')
+  const [chatHistory, setChatHistory] = useState<ChatMessage[]>([])
+
+  // Fetch server caps once on mount (no dependency loop).
   useEffect(() => {
-    fetch('http://localhost:8000/health')
+    let cancelled = false
+    fetch(`${API_BASE}/api/settings`)
       .then(res => res.json())
       .then(data => {
-        setGeminiEnabled(data.gemini_enabled)
-        if (!data.gemini_enabled && activeTab === 'chat') {
-          setActiveTab('analytics')
+        if (cancelled) return
+        setCaps({ ...DEFAULT_CAPS, ...data })
+        const frac = Number(data.chat_context_fraction ?? DEFAULT_CAPS.chat_context_fraction)
+        if (Number.isFinite(frac)) setChatContextFraction(Math.min(1, Math.max(0.05, frac)))
+        if (!data.gemini_enabled) {
+          setActiveTab(prev => (prev === 'chat' ? 'analytics' : prev))
         }
       })
-      .catch(e => console.error("Failed to fetch health check", e))
-  }, [activeTab])
+      .catch(e => console.error("Failed to fetch server settings", e))
+    return () => { cancelled = true }
+  }, [])
   
 
   const [currentPage, setCurrentPage] = useState(1)
@@ -112,87 +189,113 @@ function App() {
     { value: 300, label: '300' },
     { value: 500, label: '500' },
     { value: 1000, label: '1000' },
-    { value: 99999, label: 'All Comments' }
+    { value: Math.min(caps.max_process_limit, FETCH_ALL_SENTINEL), label: `Max (${caps.max_process_limit})` },
+    { value: FETCH_ALL_SENTINEL, label: 'All Comments' },
   ]
+
+  const pollTimers = useRef<number[]>([])
+  const clearPollTimers = () => {
+    pollTimers.current.forEach(t => window.clearTimeout(t))
+    pollTimers.current = []
+  }
+  useEffect(() => clearPollTimers, [])
+
+  const apiFetch = useCallback(async (path: string, init?: RequestInit, signal?: AbortSignal) => {
+    const res = await fetch(`${API_BASE}${path}`, { ...init, signal })
+    let data: unknown = null
+    try { data = await res.json() } catch { data = null }
+    return { res, data: data as Record<string, unknown> }
+  }, [])
 
   const handleProcess = async (e: React.FormEvent) => {
     e.preventDefault()
     if (!url) return
     setLoading(true)
     setShowDropdown(false)
-    
+    clearPollTimers()
+
     try {
-      const res = await fetch('http://localhost:8000/api/videos', {
+      const { res, data } = await apiFetch('/api/videos', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url, limit })
+        body: JSON.stringify({
+          url,
+          limit,
+          chat_context_limit: useCustomChatContext ? chatContextLimit : null,
+          chat_context_fraction: useCustomChatContext ? chatContextFraction : null,
+        })
       })
-      const data = await res.json()
-      
+      const video_id = Number(data.video_id)
+
       if (res.ok) {
-        setVideoId(data.video_id)
-        setStatus(data.status)
-        
+        setVideoId(video_id)
+        setStatus(String(data.status ?? ''))
+        setChatHistory([])
+
         if (data.status === 'completed') {
           setActiveTab('analytics')
-          fetchStats(data.video_id)
-          fetchComments(data.video_id, 0, false)
-          pollLogs(data.video_id) // Fetch logs once so the tab isn't empty
-          checkStatus(data.video_id) // Just to get metadata
+          fetchStats(video_id)
+          setCurrentPage(1)
+          fetchComments(video_id, 1, commentLimit)
+          pollLogs(video_id) // Fetch logs once so the tab isn't empty
+          checkStatus(video_id) // Just to get metadata
         } else {
           setActiveTab('logs') // Show logs if it's new and processing
-          checkStatus(data.video_id)
-          pollLogs(data.video_id)
+          checkStatus(video_id)
+          pollLogs(video_id)
         }
       } else {
-        alert(data.detail || 'Error processing video')
+        showToast(String(data.detail || 'Error processing video'), 'error')
         setLoading(false)
       }
     } catch (e) {
-      alert('Failed to connect to API. Please ensure the backend is running.')
+      console.error(e)
+      showToast('Failed to connect to API. Please ensure the backend is running.', 'error')
       setLoading(false)
     }
   }
 
   const checkStatus = async (id: number) => {
     try {
-      const res = await fetch(`http://localhost:8000/api/videos/${id}`)
-      const data = await res.json()
-      setStatus(data.status)
+      const { data } = await apiFetch(`/api/videos/${id}`)
+      setStatus(String(data.status ?? ''))
       setVideoData({
-        title: data.title,
-        channel: data.channel,
-        thumbnail: data.thumbnail,
-        processed_comments: data.processed_comments
+        title: data.title as string | undefined,
+        channel: data.channel as string | undefined,
+        thumbnail: data.thumbnail as string | undefined,
+        processed_comments: Number(data.processed_comments ?? 0),
+        chat_context_limit: (data.chat_context_limit as number | null) ?? null,
+        chat_context_fraction: (data.chat_context_fraction as number | null) ?? null,
       })
-      
+
       if (data.status !== 'completed' && data.status !== 'failed') {
-        setTimeout(() => checkStatus(id), 2000)
+        const t = window.setTimeout(() => checkStatus(id), 2000)
+        pollTimers.current.push(t)
       } else {
         setLoading(false)
         fetchStats(id)
         setCurrentPage(1)
         fetchComments(id, 1, commentLimit) // Fetch comments when done
         pollLogs(id) // Fetch logs so tab isn't empty
-        if (data.status === 'completed') setActiveTab('analytics')
+        if (data.status === 'completed') setActiveTab(geminiEnabled ? 'chat' : 'analytics')
       }
     } catch (e) {
+      console.error(e)
       setLoading(false)
     }
   }
 
   const pollLogs = async (id: number) => {
     try {
-      const res = await fetch(`http://localhost:8000/api/videos/${id}/logs`)
-      const data = await res.json()
-      setLogs(data)
-      
+      const { data } = await apiFetch(`/api/videos/${id}/logs`)
+      setLogs(Array.isArray(data) ? (data as unknown as LogEntry[]) : [])
+
       // Continue polling if not completed or failed
-      fetch(`http://localhost:8000/api/videos/${id}`).then(r => r.json()).then(statusData => {
-         if (statusData.status !== 'completed' && statusData.status !== 'failed') {
-            setTimeout(() => pollLogs(id), 2000)
-         }
-      })
+      const { data: statusData } = await apiFetch(`/api/videos/${id}`)
+      if (statusData.status !== 'completed' && statusData.status !== 'failed') {
+        const t = window.setTimeout(() => pollLogs(id), 2000)
+        pollTimers.current.push(t)
+      }
     } catch (e) {
       console.error("Failed to fetch logs")
     }
@@ -200,10 +303,9 @@ function App() {
 
   const fetchStats = async (id: number) => {
     try {
-      const res = await fetch(`http://localhost:8000/api/videos/${id}/stats`)
+      const { res, data } = await apiFetch(`/api/videos/${id}/stats`)
       if (res.ok) {
-        const data = await res.json()
-        setStats(data)
+        setStats(data as unknown as VideoStats)
       }
     } catch (e) {
       console.error("Failed to fetch stats")
@@ -212,12 +314,13 @@ function App() {
 
 
 
-  const fetchComments = async (id: number, page: number, limit: number) => {
+  const fetchComments = async (id: number, page: number, perPage: number) => {
     try {
-      const skip = (page - 1) * limit;
-      const res = await fetch(`http://localhost:8000/api/videos/${id}/comments?skip=${skip}&limit=${limit}`)
-      const data = await res.json()
-      setRawComments(data)
+      const safePage = Math.max(1, page)
+      const safePerPage = Math.max(1, Math.min(perPage, caps.max_comment_page_size))
+      const skip = (safePage - 1) * safePerPage;
+      const { data } = await apiFetch(`/api/videos/${id}/comments?skip=${skip}&limit=${safePerPage}`)
+      setRawComments(Array.isArray(data) ? (data as unknown as RawComment[]) : [])
     } catch (e) {
       console.error("Failed to fetch comments")
     }
@@ -227,14 +330,18 @@ function App() {
     if (videoId && status === 'completed') {
       fetchComments(videoId, currentPage, commentLimit)
     }
-  }, [currentPage, commentLimit])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentPage, commentLimit, videoId, status])
 
   const handleNewAnalysis = () => {
+    clearPollTimers()
     setVideoId(null)
     setUrl('')
     setStats(null)
     setRawComments([])
     setLogs([])
+    setChatHistory([])
+    setStatus('')
     setActiveTab('chat')
   }
 
@@ -244,15 +351,20 @@ function App() {
 
   const executeResetDatabase = async () => {
     try {
-      const res = await fetch('http://localhost:8000/api/videos/reset-database', { method: 'POST' })
+      const headers: Record<string, string> = {}
+      if (adminToken.trim()) headers['X-Admin-Token'] = adminToken.trim()
+      const { res, data } = await apiFetch('/api/videos/reset-database', { method: 'POST', headers })
       if (res.ok) {
         showToast("Database reset successfully.", "success")
+        clearPollTimers()
         setVideoId(null)
         setStatus('')
         setUrl('')
         setVideoData({})
+      } else if (res.status === 403) {
+        showToast("Admin token required. Set it in Settings.", "error")
       } else {
-        showToast("Failed to reset database.", "error")
+        showToast(String(data.detail || "Failed to reset database."), "error")
       }
     } catch (e) {
       console.error(e)
@@ -268,10 +380,11 @@ function App() {
   const executeStopProcess = async () => {
     if (videoId) {
       try {
-        await fetch(`http://localhost:8000/api/videos/${videoId}/cancel`, { method: 'POST' });
+        await apiFetch(`/api/videos/${videoId}/cancel`, { method: 'POST' });
       } catch (e) {
         console.error(e);
       }
+      clearPollTimers()
       setVideoId(null);
       setStatus('');
       setUrl('');
@@ -284,26 +397,64 @@ function App() {
   const handleAsk = async (e: React.FormEvent) => {
     e.preventDefault()
     if (!videoId || !question.trim()) return
-    
+    if (question.length > caps.max_question_length) {
+      showToast(`Question too long (max ${caps.max_question_length} chars).`, 'error')
+      return
+    }
+
     const userQ = question
     setQuestion('')
     setAsking(true)
-    
+
     setChatHistory(prev => [...prev, { type: 'question', content: userQ }])
-    
+
     try {
-      const res = await fetch(`http://localhost:8000/api/videos/${videoId}/chat`, {
+      const { res, data } = await apiFetch(`/api/videos/${videoId}/chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ question: userQ })
+        body: JSON.stringify({
+          question: userQ,
+          context_limit: useCustomChatContext ? chatContextLimit : null,
+        })
       })
-      const data = await res.json()
-      setChatHistory(prev => [...prev, { type: 'answer', content: data }])
+      if (res.ok) {
+        setChatHistory(prev => [...prev, { type: 'answer', content: data as unknown as ChatAnswer }])
+      } else {
+        setChatHistory(prev => [...prev, { type: 'error', content: String(data.detail || 'Failed to retrieve answer from server.') }])
+      }
     } catch (e) {
+      console.error(e)
       setChatHistory(prev => [...prev, { type: 'error', content: 'Failed to retrieve answer from server.' }])
     }
     setAsking(false)
   }
+
+  const handleSaveVideoSettings = async () => {
+    if (!videoId) return
+    try {
+      const { res, data } = await apiFetch(`/api/videos/${videoId}/settings`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_context_limit: useCustomChatContext ? chatContextLimit : null,
+          chat_context_fraction: useCustomChatContext ? chatContextFraction : null,
+        }),
+      })
+      if (res.ok) {
+        showToast('Video settings saved.', 'success')
+        setVideoData(prev => ({
+          ...prev,
+          chat_context_limit: (data.chat_context_limit as number | null) ?? null,
+          chat_context_fraction: (data.chat_context_fraction as number | null) ?? null,
+        }))
+      } else {
+        showToast(String(data.detail || 'Failed to save settings.'), 'error')
+      }
+    } catch (e) {
+      console.error(e)
+      showToast('Error connecting to server.', 'error')
+    }
+  };
 
   const handleExportChat = () => {
     if (chatHistory.length === 0) return;
@@ -374,13 +525,76 @@ function App() {
   return (
     <div className="app-layout">
       <header className="top-nav">
-        <div className="nav-container">
+        <div className="nav-container nav-split">
           <div className="logo">
             <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg>
             <span>Echolens Intelligence</span>
           </div>
+          <button className="btn-nav-settings" onClick={() => setShowSettings(v => !v)} title="Adjust limits & admin token">
+            ⚙ Settings
+          </button>
         </div>
       </header>
+
+      {showSettings && (
+        <div className="settings-bar">
+          <div className="settings-grid">
+            <label className="settings-field">
+              <span className="settings-label">Fetch limit (max {caps.max_process_limit}) <InfoTip text="Jumlah komentar YouTube yang diambil per analisis. Makin besar makin lengkap tapi makin lama dan makin banyak kuota API. 'All Comments' mengambil sampai batas server." /></span>
+              <input
+                type="number" min={1} max={caps.max_process_limit}
+                value={limit === FETCH_ALL_SENTINEL ? caps.max_process_limit : limit}
+                onChange={e => setLimit(Math.max(1, Math.min(caps.max_process_limit, Number(e.target.value) || 1)))}
+              />
+            </label>
+            <label className="settings-field checkbox">
+              <input type="checkbox" checked={useCustomChatContext} onChange={e => setUseCustomChatContext(e.target.checked)} />
+              <span className="settings-label">Custom AI context <InfoTip text="Aktifkan untuk mengatur sendiri berapa banyak komentar yang dikirim ke AI saat bertanya. Jika mati, server memakai default (25% komentar, min 20, max 100)." /></span>
+            </label>
+            <label className="settings-field">
+              <span className="settings-label">Chat context (5–{caps.max_chat_context}) <InfoTip text="Jumlah komentar teratas (berdasarkan likes, non-spam) yang dibaca AI untuk menjawab tiap pertanyaan. Lebih besar = jawaban lebih kaya tapi lebih lambat dan boros kuota Gemini." /></span>
+              <input
+                type="number" min={5} max={caps.max_chat_context}
+                value={chatContextLimit}
+                disabled={!useCustomChatContext}
+                onChange={e => setChatContextLimit(Math.max(5, Math.min(caps.max_chat_context, Number(e.target.value) || 5)))}
+              />
+            </label>
+            <label className="settings-field">
+              <span className="settings-label">Context fraction (5–100%) <InfoTip text="Alternatif otomatis: ambil sekian persen dari total komentar sebagai konteks AI. Dipakai saat 'Chat context' tidak diisi manual. Contoh 25% dari 400 komentar = 100 (lalu dibatasi max server)." /></span>
+              <input
+                type="number" min={5} max={100}
+                value={Math.round(chatContextFraction * 100)}
+                disabled={!useCustomChatContext}
+                onChange={e => setChatContextFraction(Math.max(0.05, Math.min(1, (Number(e.target.value) || 25) / 100)))}
+              />
+            </label>
+            <label className="settings-field">
+              <span className="settings-label">Admin token (for Reset DB) <InfoTip text="Kata sandi khusus untuk tombol Reset Database, dikirim sebagai header X-Admin-Token. Wajib diisi jika server mengatur ADMIN_TOKEN di .env; kosongkan jika server tidak mengaturnya." /></span>
+              <input
+                type="password" placeholder="X-Admin-Token (optional)"
+                value={adminToken}
+                onChange={e => setAdminToken(e.target.value)}
+              />
+            </label>
+            <label className="settings-field">
+              <span className="settings-label">Comments per page (max {caps.max_comment_page_size}) <InfoTip text="Jumlah komentar yang ditampilkan per halaman di tab Raw Comments. Murni tampilan — tidak memengaruhi analisis atau AI." /></span>
+              <input
+                type="number" min={5} max={caps.max_comment_page_size}
+                value={commentLimit}
+                onChange={e => {
+                  setCommentLimit(Math.max(5, Math.min(caps.max_comment_page_size, Number(e.target.value) || 15)))
+                  setCurrentPage(1)
+                }}
+              />
+            </label>
+          </div>
+          <p className="settings-hint">
+            Limits are enforced server-side. “All Comments” fetches up to {caps.max_process_limit} (server cap).
+            {!caps.gemini_enabled && ' AI Chat is disabled (no Gemini key).'}
+          </p>
+        </div>
+      )}
 
       <main className="main-content">
         {!videoId ? (
@@ -525,6 +739,12 @@ function App() {
                 >
                   Terminal Logs
                 </button>
+                <button
+                  className={`tab-btn ${activeTab === 'settings' ? 'active' : ''}`}
+                  onClick={() => setActiveTab('settings')}
+                >
+                  Settings
+                </button>
               </div>
 
               <div className="tab-content">
@@ -550,8 +770,8 @@ function App() {
                                 paddingAngle={5}
                                 dataKey="value"
                               >
-                                {stats.sentiment_distribution.map((entry: any, index: number) => {
-                                  const colors: any = { positive: '#10B981', negative: '#EF4444', neutral: '#9CA3AF', mixed: '#F59E0B' }
+                                {stats.sentiment_distribution.map((entry: SentimentSlice, index: number) => {
+                                  const colors: Record<string, string> = { positive: '#10B981', negative: '#EF4444', neutral: '#9CA3AF', mixed: '#F59E0B' }
                                   return <Cell key={`cell-${index}`} fill={colors[entry.name] || '#9CA3AF'} />
                                 })}
                               </Pie>
@@ -615,16 +835,22 @@ function App() {
                           <div key={i} className={`message-wrapper ${msg.type}`}>
                             {msg.type === 'question' ? (
                               <div className="user-message">{msg.content}</div>
-                            ) : (
+                            ) : msg.type === 'answer' ? (
                               <div className="ai-message">
                                 <div className="ai-answer-header">
                                   <span className="ai-label">AI Analysis</span>
-                                  <span className={`confidence-pill ${msg.content.confidence.toLowerCase()}`}>
+                                  <span className={`confidence-pill ${(msg.content.confidence || 'low').toLowerCase()}`}>
                                     {msg.content.confidence} Confidence
                                   </span>
                                 </div>
                                 <div className="ai-text">{msg.content.answer}</div>
-                                
+                                {typeof msg.content.context_used === 'number' && (
+                                  <div className="ai-context-meta">
+                                    Context: {msg.content.context_used} comments
+                                    {typeof msg.content.context_limit === 'number' ? ` (limit ${msg.content.context_limit})` : ''}
+                                  </div>
+                                )}
+
                                 {msg.content.relevant_aspects && msg.content.relevant_aspects.length > 0 && (
                                   <div className="ai-aspects">
                                     {msg.content.relevant_aspects.map((asp: string, j: number) => (
@@ -632,17 +858,17 @@ function App() {
                                     ))}
                                   </div>
                                 )}
-                                
+
                                 {msg.content.evidence && msg.content.evidence.length > 0 && (
                                   <div className="evidence-section">
                                     <div className="evidence-title">Sources from Comments:</div>
                                     <div className="evidence-grid">
-                                      {msg.content.evidence.map((ev: any, j: number) => (
+                                      {msg.content.evidence.map((ev: ChatEvidence, j: number) => (
                                         <div key={j} className="evidence-item">
                                           <div className="evidence-item-header">
                                             <span className="evidence-author">{ev.author}</span>
-                                            <span className={`evidence-sentiment ${ev.sentiment?.toLowerCase() || 'neutral'}`}>
-                                              {ev.sentiment?.toUpperCase() || 'NEUTRAL'}
+                                            <span className={`evidence-sentiment ${(ev.sentiment || 'neutral').toLowerCase()}`}>
+                                              {(ev.sentiment || 'NEUTRAL').toUpperCase()}
                                             </span>
                                           </div>
                                           <div className="evidence-quote">"{ev.text}"</div>
@@ -652,6 +878,8 @@ function App() {
                                   </div>
                                 )}
                               </div>
+                            ) : (
+                              <div className="ai-message"><div className="ai-text">{msg.content}</div></div>
                             )}
                           </div>
                         ))
@@ -713,8 +941,8 @@ function App() {
                         <h3>Collected Comments ({videoData.processed_comments || rawComments.length})</h3>
                         <p>Raw data and AI structured analysis for each comment.</p>
                       </div>
-                      <a 
-                        href={`http://localhost:8000/api/videos/${videoId}/export`} 
+                      <a
+                        href={`${API_BASE}/api/videos/${videoId}/export`}
                         className="btn-export"
                         target="_blank"
                         rel="noreferrer"
@@ -746,11 +974,11 @@ function App() {
                         
                       <div className="pagination-controls">
                         <div className="pagination-left">
-                          <label>Items per page:</label>
-                          <select 
-                            value={commentLimit} 
+                          <label>Items per page (max {caps.max_comment_page_size}):</label>
+                          <select
+                            value={commentLimit}
                             onChange={(e) => {
-                              setCommentLimit(Number(e.target.value));
+                              setCommentLimit(Math.max(1, Math.min(caps.max_comment_page_size, Number(e.target.value))));
                               setCurrentPage(1);
                             }}
                           >
@@ -758,6 +986,9 @@ function App() {
                             <option value={15}>15</option>
                             <option value={30}>30</option>
                             <option value={50}>50</option>
+                            {caps.max_comment_page_size > 50 && (
+                              <option value={caps.max_comment_page_size}>{caps.max_comment_page_size}</option>
+                            )}
                           </select>
                         </div>
                         <div className="pagination-right">
@@ -803,6 +1034,71 @@ function App() {
                       )}
                       <div ref={logsEndRef} />
                     </div>
+                  </div>
+                )}
+
+                {activeTab === 'settings' && (
+                  <div className="settings-panel">
+                    <h3>Analysis Limits</h3>
+                    <p className="settings-desc">
+                      Adjust how much data is fetched and sent to the AI. Server caps:
+                      fetch {caps.max_process_limit}, chat {caps.max_chat_context},
+                      page {caps.max_comment_page_size}, question {caps.max_question_length} chars.
+                    </p>
+                    <label className="settings-field checkbox">
+                      <input type="checkbox" checked={useCustomChatContext} onChange={e => setUseCustomChatContext(e.target.checked)} />
+                      <span className="settings-label">Use custom AI context for this video <InfoTip text="Jika aktif, preferensi konteks AI di bawah disimpan khusus untuk video ini (tombol Save). Jika mati, video memakai default server." /></span>
+                    </label>
+                    <div className="settings-grid">
+                      <label className="settings-field">
+                        <span className="settings-label">Chat context comments (5–{caps.max_chat_context}) <InfoTip text="Jumlah komentar teratas yang dibaca AI untuk video ini. Prioritas: isian per pertanyaan > simpanan video ini > default server." /></span>
+                        <input
+                          type="number" min={5} max={caps.max_chat_context}
+                          value={chatContextLimit}
+                          disabled={!useCustomChatContext}
+                          onChange={e => setChatContextLimit(Math.max(5, Math.min(caps.max_chat_context, Number(e.target.value) || 5)))}
+                        />
+                      </label>
+                      <label className="settings-field">
+                        <span className="settings-label">Context fraction % (5–100) <InfoTip text="Persentase otomatis dari total komentar video ini sebagai konteks AI. Contoh: 25% dari 400 = 100 komentar (dibatasi max server)." /></span>
+                        <input
+                          type="number" min={5} max={100}
+                          value={Math.round(chatContextFraction * 100)}
+                          disabled={!useCustomChatContext}
+                          onChange={e => setChatContextFraction(Math.max(0.05, Math.min(1, (Number(e.target.value) || 25) / 100)))}
+                        />
+                      </label>
+                      <label className="settings-field">
+                        <span className="settings-label">Comments per page (max {caps.max_comment_page_size}) <InfoTip text="Jumlah komentar per halaman di tab Raw Comments. Hanya tampilan, tidak memengaruhi analisis." /></span>
+                        <input
+                          type="number" min={5} max={caps.max_comment_page_size}
+                          value={commentLimit}
+                          onChange={e => {
+                            setCommentLimit(Math.max(5, Math.min(caps.max_comment_page_size, Number(e.target.value) || 15)))
+                            setCurrentPage(1)
+                          }}
+                        />
+                      </label>
+                      <label className="settings-field">
+                        <span className="settings-label">Admin token (Reset DB) <InfoTip text="Diperlukan hanya jika server mengatur ADMIN_TOKEN. Tanpa itu, tombol Reset Database akan ditolak (403)." /></span>
+                        <input
+                          type="password" placeholder="X-Admin-Token"
+                          value={adminToken}
+                          onChange={e => setAdminToken(e.target.value)}
+                        />
+                      </label>
+                    </div>
+                    <div className="settings-actions">
+                      <button className="btn-sidebar-action new-analysis" onClick={handleSaveVideoSettings} disabled={!videoId}>
+                        Save Video Settings
+                      </button>
+                    </div>
+                    {(videoData.chat_context_limit != null || videoData.chat_context_fraction != null) && (
+                      <p className="settings-hint">
+                        Saved for this video: limit {videoData.chat_context_limit ?? 'default'},
+                        fraction {videoData.chat_context_fraction != null ? `${Math.round(videoData.chat_context_fraction * 100)}%` : 'default'}.
+                      </p>
+                    )}
                   </div>
                 )}
               </div>

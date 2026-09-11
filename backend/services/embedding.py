@@ -1,6 +1,10 @@
+import logging
+
 from google import genai
 
 from core.config import settings
+
+logger = logging.getLogger(__name__)
 
 
 class GeminiEmbeddingService:
@@ -16,8 +20,8 @@ class GeminiEmbeddingService:
                 model=self.model_id, contents=text
             )
             if response.embeddings:
-                return response.embeddings[0].values
-        except Exception as e:
-            print(f"Error generating embedding: {e}")
+                return list(response.embeddings[0].values)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Error generating embedding: %s", exc)
 
         return []

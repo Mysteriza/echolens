@@ -1,22 +1,15 @@
-import re
+import logging
+import time
 
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
 from core.config import settings
+from core.validation import extract_video_id
 
+logger = logging.getLogger(__name__)
 
-def extract_video_id(url: str) -> str:
-    # Handle various YouTube URL formats
-    pattern = r"(?:v=|\/)([0-9A-Za-z_-]{11}).*"
-    match = re.search(pattern, url)
-    if match:
-        return match.group(1)
-
-    # Handle youtu.be format
-    if "youtu.be/" in url:
-        return url.split("youtu.be/")[1][:11]
-
-    raise ValueError("Invalid YouTube URL")
+__all__ = ["YouTubeService", "extract_video_id"]
 
 
 class YouTubeService:
@@ -25,9 +18,50 @@ class YouTubeService:
             raise ValueError("YOUTUBE_API_KEY is not set")
         self.youtube = build("youtube", "v3", developerKey=settings.YOUTUBE_API_KEY)
 
+    def _execute_with_retry(self, request, attempts: int = 4):
+        """Execute a Google API request with exponential backoff on quota/5xx."""
+        delay = 1.0
+        last_exc: Exception | None = None
+        for attempt in range(attempts):
+            try:
+                return request.execute()
+            except HttpError as exc:
+                last_exc = exc
+                status = getattr(exc.resp, "status", 0)
+                # Retry rate limits and server errors; fail fast otherwise.
+                if status in (403, 429, 500, 502, 503) and attempt < attempts - 1:
+                    logger.warning(
+                        "YouTube API HTTP %s (attempt %d/%d). Retrying in %.1fs",
+                        status,
+                        attempt + 1,
+                        attempts,
+                        delay,
+                    )
+                    time.sleep(delay)
+                    delay *= 2
+                    continue
+                raise
+            except (OSError, TimeoutError) as exc:
+                last_exc = exc
+                if attempt < attempts - 1:
+                    time.sleep(delay)
+                    delay *= 2
+                    continue
+                raise
+        if last_exc:
+            raise last_exc
+        raise RuntimeError("YouTube request failed without response.")
+
     def get_video_metadata(self, video_id: str) -> dict:
         request = self.youtube.videos().list(part="snippet,statistics", id=video_id)
-        response = request.execute()
+        try:
+            response = self._execute_with_retry(request)
+        except HttpError as exc:
+            status = getattr(exc.resp, "status", 0)
+            if status == 404:
+                raise ValueError("Video not found") from exc
+            logger.error("YouTube metadata error: %s", exc)
+            raise ValueError("Failed to fetch video metadata.") from exc
 
         if not response.get("items"):
             raise ValueError("Video not found")
@@ -45,7 +79,7 @@ class YouTubeService:
         }
 
     def get_comments(self, video_id: str, max_results: int = 100) -> list:
-        comments = []
+        comments: list[dict] = []
         try:
             request = self.youtube.commentThreads().list(
                 part="snippet,replies",
@@ -55,7 +89,19 @@ class YouTubeService:
             )
 
             while request and len(comments) < max_results:
-                response = request.execute()
+                try:
+                    response = self._execute_with_retry(request)
+                except HttpError as exc:
+                    status = getattr(exc.resp, "status", 0)
+                    if status in (403, 404):
+                        # Comments disabled / not found: return what we have.
+                        logger.warning(
+                            "YouTube comments unavailable (HTTP %s). Returning %d collected.",
+                            status,
+                            len(comments),
+                        )
+                        break
+                    raise
 
                 for item in response.get("items", []):
                     top_level = item["snippet"]["topLevelComment"]
@@ -105,7 +151,7 @@ class YouTubeService:
                     )
                 else:
                     break
-        except Exception as e:
-            print(f"Error fetching comments: {e}")
+        except Exception as exc:  # noqa: BLE001 - return partial results, never crash
+            logger.error("Error fetching comments: %s", exc)
 
         return comments

@@ -1,10 +1,13 @@
 import json
+import logging
 
 from google import genai
 from google.genai import types
 from pydantic import BaseModel, Field
 
 from core.config import settings
+
+logger = logging.getLogger(__name__)
 
 
 class ChatAnswerSchema(BaseModel):
@@ -80,9 +83,15 @@ User Question:
             )
             if response.text:
                 data = json.loads(response.text)
-                return data
-        except Exception as e:
-            print(f"Error generating chat answer: {e}")
+                # Validate shape via schema; fall back to raw dict on mismatch.
+                try:
+                    validated = ChatAnswerSchema(**data)
+                    return validated.model_dump()
+                except Exception:  # noqa: BLE001
+                    logger.warning("Chat response failed schema validation; using raw.")
+                    return data
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Error generating chat answer: %s", exc)
 
         return {
             "answer": "Gagal menghasilkan jawaban karena error internal.",

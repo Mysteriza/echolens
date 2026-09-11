@@ -48,6 +48,12 @@ dist-ssr
 logs
 *.log
 npm-debug.log*
+
+# Local dev databases (SQLite fallback)
+*.db
+*.db-journal
+*.sqlite
+*.sqlite-journal
 yarn-debug.log*
 yarn-error.log*
 

@@ -68,6 +68,171 @@ body {
   padding: 0 2rem;
 }
 
+.nav-split {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.btn-nav-settings {
+  border: 1px solid var(--border-light);
+  background: var(--bg-surface);
+  border-radius: var(--radius-full);
+  padding: 0.4rem 0.9rem;
+  cursor: pointer;
+  font-weight: 600;
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+}
+
+.btn-nav-settings:hover {
+  background: var(--bg-surface-hover);
+  color: var(--text-primary);
+}
+
+.settings-bar {
+  border-bottom: 1px solid var(--border-light);
+  background: var(--bg-surface);
+  padding: 1rem 2rem;
+}
+
+.settings-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 0.75rem;
+  max-width: 1200px;
+  margin: 0 auto;
+}
+
+.settings-field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+  font-weight: 600;
+}
+
+.settings-field input[type="number"],
+.settings-field input[type="password"] {
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  padding: 0.45rem 0.6rem;
+  font-size: 0.9rem;
+}
+
+.settings-field.checkbox {
+  flex-direction: row;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.settings-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+/* Small "i" info badge with hover/focus tooltip for settings explanations. */
+.info-tip {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--bg-surface-hover);
+  border: 1px solid var(--border-strong);
+  color: var(--text-secondary);
+  font-size: 0.65rem;
+  font-weight: 700;
+  font-style: italic;
+  font-family: Georgia, serif;
+  cursor: help;
+  flex-shrink: 0;
+  user-select: none;
+}
+
+.info-tip:hover,
+.info-tip:focus-visible {
+  background: var(--text-primary);
+  border-color: var(--text-primary);
+  color: #fff;
+  outline: none;
+}
+
+.info-tip::after {
+  content: attr(data-tip);
+  position: absolute;
+  /* Show BELOW the icon: the settings bar sits at the very top of the page,
+     so an above-positioned tooltip gets clipped by the viewport edge. */
+  top: calc(100% + 8px);
+  left: 50%;
+  transform: translateX(-50%) translateY(-2px);
+  width: max-content;
+  max-width: 240px;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  background: var(--text-primary);
+  color: #fff;
+  font-size: 0.75rem;
+  font-weight: 400;
+  font-style: normal;
+  font-family: var(--font-sans);
+  line-height: 1.4;
+  text-align: left;
+  padding: 0.5rem 0.65rem;
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow-md);
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity 0.15s ease, transform 0.15s ease, visibility 0.15s;
+  z-index: 50;
+  pointer-events: none;
+}
+
+.info-tip:hover::after,
+.info-tip:focus-visible::after {
+  opacity: 1;
+  visibility: visible;
+  transform: translateX(-50%) translateY(0);
+}
+
+.settings-hint {
+  max-width: 1200px;
+  margin: 0.6rem auto 0 auto;
+  font-size: 0.8rem;
+  color: var(--text-tertiary);
+}
+
+.settings-panel {
+  background: var(--bg-surface);
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius-lg);
+  padding: 1.5rem;
+}
+
+.settings-panel h3 {
+  margin-bottom: 0.25rem;
+}
+
+.settings-desc {
+  color: var(--text-secondary);
+  font-size: 0.9rem;
+  margin-bottom: 1rem;
+}
+
+.settings-actions {
+  margin-top: 1rem;
+}
+
+.ai-context-meta {
+  font-size: 0.75rem;
+  color: var(--text-tertiary);
+  margin-top: 0.5rem;
+}
+
 .logo {
   display: flex;
   align-items: center;
@@ -891,15 +1056,6 @@ body {
   line-height: 1.5;
 }
 
-.rc-summary {
-  font-size: 0.875rem;
-  color: var(--text-secondary);
-  background: var(--bg-surface);
-  padding: 0.75rem;
-  border-radius: var(--radius-sm);
-  border-left: 2px solid var(--border-strong);
-}
-
 .empty-state {
   color: var(--text-tertiary);
   font-style: italic;
@@ -1025,76 +1181,6 @@ body {
 
 @keyframes blink {
   50% { opacity: 0; }
-}
-
-/* Video Report Card */
-.video-report-card {
-  background: var(--bg-surface);
-  border: 1px solid var(--border-light);
-  border-radius: var(--radius-lg);
-  padding: 1.5rem;
-  margin-bottom: 2rem;
-}
-
-.vr-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  margin-bottom: 1rem;
-}
-
-.vr-header h3 {
-  font-size: 1.125rem;
-  font-weight: 600;
-  color: var(--text-primary);
-}
-
-.vr-sentiment-badge {
-  background: var(--accent-primary);
-  color: #fff;
-  padding: 0.25rem 0.75rem;
-  border-radius: var(--radius-full);
-  font-size: 0.8125rem;
-  font-weight: 600;
-}
-
-.vr-summary {
-  font-size: 0.9375rem;
-  color: var(--text-secondary);
-  line-height: 1.6;
-  margin-bottom: 1.5rem;
-}
-
-.vr-columns {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 1.5rem;
-}
-
-.vr-col h4 {
-  font-size: 0.875rem;
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
-  color: var(--text-tertiary);
-  margin-bottom: 0.75rem;
-}
-
-.vr-col ul {
-  padding-left: 1.25rem;
-  font-size: 0.875rem;
-  color: var(--text-primary);
-}
-
-.vr-col li {
-  margin-bottom: 0.5rem;
-}
-
-.vr-col.complaints ul {
-  color: #991B1B;
-}
-
-.vr-col.praises ul {
-  color: #166534;
 }
 
 /* Analytics Tab */

@@ -1,40 +1,48 @@
+import asyncio
 import csv
 import io
+import logging
 import re
+from collections import Counter
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Request
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
-from sqlalchemy import select, text
+from pydantic import BaseModel, Field
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from database.session import async_session, get_db
+from core.cancellation import cancellations
+from core.config import settings
+from core.rate_limit import limiter
+from core.validation import extract_video_id
+from database.session import get_db, get_session_factory
 from models.db import (
     Comment,
-    CommentAnalysis,
-    CommentAspect,
     Video,
     VideoLog,
-    VideoReport,
 )
 from services.chat import ChatService
-from services.embedding import GeminiEmbeddingService
+from services.pipeline import FETCH_ALL_SENTINEL, bulk_insert_classified, flag_spam
 from services.retrieval import RetrievalService
-from services.youtube import YouTubeService, extract_video_id
+from services.youtube import YouTubeService
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/videos", tags=["videos"])
-
-# Global set to track cancelled tasks
-cancellation_tokens = set()
 
 
 class ProcessVideoRequest(BaseModel):
     url: str
-    limit: int = 300
+    limit: int = Field(default=300, ge=1, le=2000)
+    # Optional user-adjustable chat context (overrides server fraction default).
+    chat_context_limit: int | None = Field(default=None, ge=5, le=100)
+    chat_context_fraction: float | None = Field(default=None, ge=0.05, le=1.0)
 
 
 class ChatRequest(BaseModel):
-    question: str
+    question: str = Field(min_length=1, max_length=1000)
+    # Optional per-question override, clamped server-side to MAX_CHAT_CONTEXT.
+    context_limit: int | None = Field(default=None, ge=5, le=100)
 
 
 async def add_log(db: AsyncSession, video_id: int, message: str, level: str = "INFO"):
@@ -43,12 +51,53 @@ async def add_log(db: AsyncSession, video_id: int, message: str, level: str = "I
     await db.commit()
 
 
-async def process_video_background(video_id: int, youtube_id: str, limit: int):
-    async with async_session() as db:
+def require_admin(x_admin_token: str | None = None) -> None:
+    """Protect destructive endpoints when ADMIN_TOKEN is configured."""
+    if settings.ADMIN_TOKEN and x_admin_token != settings.ADMIN_TOKEN:
+        raise HTTPException(status_code=403, detail="Admin token required.")
+
+
+def _resolve_process_limit(limit: int) -> int:
+    """Clamp user limit to server cap; sentinel means 'fetch all'."""
+    if limit >= FETCH_ALL_SENTINEL:
+        return settings.MAX_PROCESS_LIMIT
+    return max(1, min(limit, settings.MAX_PROCESS_LIMIT))
+
+
+def _resolve_chat_limit(
+    total_comments: int,
+    override: int | None = None,
+    fraction: float | None = None,
+) -> int:
+    """User-customizable chat context: explicit limit wins, else fraction."""
+    if override is not None:
+        return max(5, min(override, settings.MAX_CHAT_CONTEXT))
+    frac = fraction if fraction is not None else settings.CHAT_CONTEXT_FRACTION
+    frac = max(0.05, min(frac, 1.0))
+    dynamic = max(settings.CHAT_CONTEXT_MIN, int(total_comments * frac))
+    return min(dynamic, settings.MAX_CHAT_CONTEXT)
+
+
+async def process_video_background(
+    video_id: int,
+    youtube_id: str,
+    limit: int,
+    chat_context_limit: int | None = None,
+    chat_context_fraction: float | None = None,
+):
+    async with get_session_factory()() as db:
         try:
             video = await db.get(Video, video_id)
             if not video:
+                await cancellations.clear(video_id)
                 return
+            # Persist user chat-context preference on the video row when given.
+            if chat_context_limit is not None:
+                video.chat_context_limit = max(
+                    5, min(chat_context_limit, settings.MAX_CHAT_CONTEXT)
+                )
+            if chat_context_fraction is not None:
+                video.chat_context_fraction = max(0.05, min(chat_context_fraction, 1.0))
             video.analysis_status = "collecting"
             await db.commit()
 
@@ -56,12 +105,19 @@ async def process_video_background(video_id: int, youtube_id: str, limit: int):
                 db, video_id, f"Started processing video: {video.title}", "INFO"
             )
 
-            # 1. Fetch Comments
-            if limit >= 99999:
-                log_message = "Fetching all comments from YouTube API..."
+            # 1. Fetch Comments (blocking SDK -> thread, with server-side cap)
+            effective_limit = _resolve_process_limit(limit)
+            if limit >= FETCH_ALL_SENTINEL:
+                log_message = (
+                    f"Fetching all comments from YouTube API "
+                    f"(capped at {effective_limit} by server)..."
+                )
             else:
-                log_message = f"Fetching comments from YouTube API (Limited to {limit} comments)..."
-                
+                log_message = (
+                    f"Fetching comments from YouTube API "
+                    f"(Limited to {effective_limit} comments)..."
+                )
+
             await add_log(
                 db,
                 video_id,
@@ -69,7 +125,9 @@ async def process_video_background(video_id: int, youtube_id: str, limit: int):
                 "INFO",
             )
             yt_service = YouTubeService()
-            comments_data = yt_service.get_comments(youtube_id, max_results=limit)
+            comments_data = await asyncio.to_thread(
+                yt_service.get_comments, youtube_id, effective_limit
+            )
 
             if not comments_data:
                 await add_log(
@@ -93,19 +151,14 @@ async def process_video_background(video_id: int, youtube_id: str, limit: int):
             await db.commit()
 
             # Use local IndoBERT for per-comment sentiment classification
-            import asyncio
-
             from services.nlp import IndoBERTService
 
             nlp_service = IndoBERTService()
-            
+
             await add_log(
                 db, video_id, "[Step 1] Loading Sentiment Analysis Model (IndoBERT)...", "INFO"
             )
             await asyncio.to_thread(nlp_service.load_indobert)
-            
-
-            embedding_service = GeminiEmbeddingService()
 
             # Insert comments and process them locally
             await add_log(
@@ -115,12 +168,10 @@ async def process_video_background(video_id: int, youtube_id: str, limit: int):
                 "INFO",
             )
 
-            import datetime
-
             batch_size = nlp_service.batch_size
 
             for i in range(0, len(comments_data), batch_size):
-                if video_id in cancellation_tokens:
+                if await cancellations.is_cancelled(video_id):
                     try:
                         v = await db.get(Video, video_id)
                         if v:
@@ -129,29 +180,16 @@ async def process_video_background(video_id: int, youtube_id: str, limit: int):
                             )
                             await db.delete(v)
                             await db.commit()
-                    except Exception:
-                        pass
-                        
-                    if video_id in cancellation_tokens:
-                        cancellation_tokens.remove(video_id)
+                    except Exception as cleanup_exc:  # noqa: BLE001
+                        logger.warning("Cancel cleanup failed: %s", cleanup_exc)
+                        await db.rollback()
+
+                    await cancellations.clear(video_id)
                     return
 
                 chunk = comments_data[i : i + batch_size]
 
-                # Spam Detection Logic (Regex for URLs, or repeating words)
-                spam_pattern = re.compile(
-                    r"(http[s]?://|www\.)|(.)\2{10,}|(\b\w+\b)(?:\s+\3){4,}",
-                    re.IGNORECASE,
-                )
-
-                valid_chunk = []
-                for c in chunk:
-                    # Mark spam if it matches regex or is extremely short
-                    if spam_pattern.search(c["text"]) or len(c["text"]) < 2:
-                        c["is_spam"] = True
-                    else:
-                        c["is_spam"] = False
-                        valid_chunk.append(c)
+                valid_chunk, spam_chunk = flag_spam(chunk)
 
                 # Batch predict only for non-spam comments
                 valid_texts = [c["text"] for c in valid_chunk]
@@ -161,73 +199,12 @@ async def process_video_background(video_id: int, youtube_id: str, limit: int):
                     else []
                 )
 
-                # Removed Zero-Shot Aspect Based Sentiment Analysis per user request
-                aspects_list = [[] for _ in valid_texts] if valid_texts else []
+                classified: list[tuple[dict, dict]] = [
+                    (c, {"sentiment": "neutral", "confidence": 0.0}) for c in spam_chunk
+                ]
+                classified.extend(zip(valid_chunk, sentiments))
 
-                # Reconstruct chunk with assigned sentiments & aspects
-                processed_chunk = []
-                valid_idx = 0
-                for c in chunk:
-                    if c["is_spam"]:
-                        processed_chunk.append(
-                            (c, {"sentiment": "neutral", "confidence": 0.0}, [])
-                        )
-                    else:
-                        processed_chunk.append(
-                            (c, sentiments[valid_idx], aspects_list[valid_idx])
-                        )
-                        valid_idx += 1
-
-                for c_data, sentiment_data, c_aspects in processed_chunk:
-                    stmt = select(Comment).where(
-                        Comment.youtube_id == c_data["youtube_id"]
-                    )
-                    existing_comment = (await db.execute(stmt)).scalar_one_or_none()
-
-                    if not existing_comment:
-                        pub_str = c_data["published_at"]
-                        if pub_str.endswith("Z"):
-                            pub_str = pub_str.replace("Z", "+00:00")
-                        pub_dt = datetime.datetime.fromisoformat(pub_str)
-
-                        db_comment = Comment(
-                            youtube_id=c_data["youtube_id"],
-                            video_id=video_id,
-                            parent_id=c_data["parent_id"],
-                            author_name=c_data["author_name"],
-                            text=c_data["text"],
-                            published_at=pub_dt,
-                            like_count=c_data["like_count"],
-                            is_reply=c_data["is_reply"],
-                            is_spam=c_data["is_spam"],
-                        )
-                        db.add(db_comment)
-                        await db.flush()
-
-                        db_analysis = CommentAnalysis(
-                            comment_id=db_comment.id,
-                            sentiment=sentiment_data["sentiment"],
-                            confidence=sentiment_data["confidence"],
-                            language="id",
-                            is_product_experience=False,
-                            is_complaint=(sentiment_data["sentiment"] == "negative"),
-                            is_praise=(sentiment_data["sentiment"] == "positive"),
-                            is_question=False,
-                            summary="",
-                            analysis_version="indobert_v1",
-                        )
-                        db.add(db_analysis)
-
-                        # Save detected aspects
-                        for asp in c_aspects:
-                            db_aspect = CommentAspect(
-                                comment_id=db_comment.id,
-                                aspect=asp,
-                                sentiment=sentiment_data["sentiment"],
-                            )
-                            db.add(db_aspect)
-
-                await db.commit()
+                await bulk_insert_classified(db, video_id, classified)
                 processed_count = min(i + batch_size, len(comments_data))
                 await add_log(
                     db,
@@ -243,60 +220,59 @@ async def process_video_background(video_id: int, youtube_id: str, limit: int):
                 "SUCCESS",
             )
 
-            # Report generation was here, removed per user request.
-
             video.analysis_status = "completed"
             await db.commit()
             await add_log(
                 db, video_id, "Analysis completed! Ready for AI Chat.", "SUCCESS"
             )
+            await cancellations.clear(video_id)
 
-        except Exception as e:
-            print(f"Error in background task: {e}")
-            await add_log(
-                db, video_id, f"Fatal error during processing: {e!s}", "ERROR"
-            )
-            video = await db.get(Video, video_id)
-            if video:
-                video.analysis_status = "failed"
-                await db.commit()
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Error in background task for video %d", video_id)
+            try:
+                await add_log(
+                    db, video_id, f"Fatal error during processing: {exc!s}", "ERROR"
+                )
+                video = await db.get(Video, video_id)
+                if video:
+                    video.analysis_status = "failed"
+                    await db.commit()
+            except Exception:  # noqa: BLE001
+                await db.rollback()
+            finally:
+                await cancellations.clear(video_id)
 
 
 @router.post("")
+@limiter.limit("10/minute")
 async def process_video(
-    request: ProcessVideoRequest,
+    request: Request,
+    payload: ProcessVideoRequest,
     background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
 ):
-    # Security Hardening: Strict URL Validation
-    url = request.url.strip()
-    if not url.startswith("https://www.youtube.com/") and not url.startswith(
-        "https://youtu.be/"
-    ):
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid YouTube URL format. Must be a secure HTTPS YouTube link.",
-        )
-
+    # Strict allowlist validation (HTTPS + YouTube hosts + 11-char ID).
     try:
-        youtube_id = extract_video_id(url)
-    except ValueError:
-        raise HTTPException(
-            status_code=400, detail="Could not extract video ID from URL"
-        )
+        youtube_id = extract_video_id(payload.url)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    # Clamp user limit server-side (Pydantic already bounds, cap again here).
+    request_limit = max(1, min(payload.limit, settings.MAX_PROCESS_LIMIT))
 
     stmt = select(Video).where(Video.youtube_id == youtube_id)
     existing_video = (await db.execute(stmt)).scalar_one_or_none()
 
     if existing_video:
-        if existing_video.id in cancellation_tokens:
-            # Race condition fix: User clicked 'Stop' and immediately re-analyzed before the background 
-            # task had time to clean up. We aggressively delete it here so a fresh one can start.
+        if await cancellations.is_cancelled(existing_video.id):
+            # Race condition fix: User clicked 'Stop' and immediately re-analyzed
+            # before the background task cleaned up. Delete so a fresh one starts.
             try:
                 await db.delete(existing_video)
                 await db.commit()
-            except Exception:
-                pass
+            except Exception as del_exc:  # noqa: BLE001
+                logger.warning("Stale video cleanup failed: %s", del_exc)
+                await db.rollback()
             existing_video = None
         else:
             return {
@@ -305,11 +281,14 @@ async def process_video(
                 "status": existing_video.analysis_status,
             }
 
-    yt_service = YouTubeService()
     try:
-        metadata = yt_service.get_video_metadata(youtube_id)
-    except ValueError:
-        raise HTTPException(status_code=404, detail="Video not found")
+        yt_service = YouTubeService()
+    except ValueError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    try:
+        metadata = await asyncio.to_thread(yt_service.get_video_metadata, youtube_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     new_video = Video(
         youtube_id=metadata["youtube_id"],
@@ -318,13 +297,28 @@ async def process_video(
         thumbnail=metadata["thumbnail"],
         comment_count=metadata["comment_count"],
         analysis_status="pending",
+        chat_context_limit=(
+            max(5, min(payload.chat_context_limit, settings.MAX_CHAT_CONTEXT))
+            if payload.chat_context_limit is not None
+            else None
+        ),
+        chat_context_fraction=(
+            max(0.05, min(payload.chat_context_fraction, 1.0))
+            if payload.chat_context_fraction is not None
+            else None
+        ),
     )
     db.add(new_video)
     await db.commit()
     await db.refresh(new_video)
 
     background_tasks.add_task(
-        process_video_background, new_video.id, youtube_id, request.limit
+        process_video_background,
+        new_video.id,
+        youtube_id,
+        request_limit,
+        payload.chat_context_limit,
+        payload.chat_context_fraction,
     )
 
     return {
@@ -333,15 +327,34 @@ async def process_video(
         "status": "pending",
     }
 
+
 @router.post("/reset-database")
-async def reset_database(db: AsyncSession = Depends(get_db)):
+@limiter.limit("5/minute")
+async def reset_database(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    x_admin_token: str | None = Header(default=None),
+):
+    require_admin(x_admin_token)
     try:
-        await db.execute(text("TRUNCATE TABLE videos CASCADE"))
+        from database.session import DB_BACKEND
+
+        if DB_BACKEND == "sqlite":
+            # SQLite has no TRUNCATE — DELETE is enough (CASCADE via FK).
+            # sqlite_sequence may not exist (no AUTOINCREMENT) — ignore that.
+            await db.execute(text("DELETE FROM videos"))
+            try:
+                await db.execute(text("DELETE FROM sqlite_sequence WHERE name='videos'"))
+            except Exception:  # noqa: BLE001
+                pass
+        else:
+            await db.execute(text("TRUNCATE TABLE videos CASCADE"))
         await db.commit()
         return {"status": "success", "message": "Database reset successful."}
-    except Exception as e:
+    except Exception as exc:  # noqa: BLE001
         await db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception("Database reset failed")
+        raise HTTPException(status_code=500, detail="Database reset failed.") from exc
 
 
 
@@ -350,11 +363,11 @@ async def cancel_video_processing(video_id: int, db: AsyncSession = Depends(get_
     video = await db.get(Video, video_id)
     if not video:
         raise HTTPException(status_code=404, detail="Video not found")
-        
+
     if video.analysis_status in ["completed", "failed"]:
         raise HTTPException(status_code=400, detail="Cannot cancel a completed or failed process")
-        
-    cancellation_tokens.add(video_id)
+
+    await cancellations.request(video_id)
     return {"status": "success", "message": "Cancellation requested"}
 
 
@@ -364,8 +377,9 @@ async def get_video(video_id: int, db: AsyncSession = Depends(get_db)):
     if not video:
         raise HTTPException(status_code=404, detail="Video not found")
 
-    stmt_comments = select(Comment.id).where(Comment.video_id == video_id)
-    comments = (await db.execute(stmt_comments)).scalars().all()
+    # COUNT(*) instead of loading all IDs into Python.
+    count_stmt = select(func.count(Comment.id)).where(Comment.video_id == video_id)
+    processed = (await db.execute(count_stmt)).scalar() or 0
 
     return {
         "id": video.id,
@@ -373,7 +387,9 @@ async def get_video(video_id: int, db: AsyncSession = Depends(get_db)):
         "channel": video.channel,
         "thumbnail": video.thumbnail,
         "status": video.analysis_status,
-        "processed_comments": len(comments),
+        "processed_comments": processed,
+        "chat_context_limit": video.chat_context_limit,
+        "chat_context_fraction": video.chat_context_fraction,
     }
 
 
@@ -393,17 +409,21 @@ async def get_video_logs(video_id: int, db: AsyncSession = Depends(get_db)):
 
 @router.get("/{video_id}/comments")
 async def get_video_comments(
-    video_id: int, skip: int = 0, limit: int = 100, db: AsyncSession = Depends(get_db)
+    video_id: int,
+    skip: int = 0,
+    limit: int = 15,
+    db: AsyncSession = Depends(get_db),
 ):
+    skip = max(0, skip)
+    limit = max(1, min(limit, settings.MAX_COMMENT_PAGE_SIZE))
     stmt = text("""
         SELECT c.id, c.author_name, c.text, c.like_count, c.is_spam,
-               ca.sentiment, ca.summary, ca.is_complaint, ca.is_praise, ca.confidence,
-               (SELECT string_agg(aspect, ', ') FROM comment_aspects WHERE comment_id = c.id) as aspect_str
+               ca.sentiment, ca.is_complaint, ca.is_praise, ca.confidence
         FROM comments c
         LEFT JOIN comment_analysis ca ON c.id = ca.comment_id
         WHERE c.video_id = :video_id
         ORDER BY c.like_count DESC
-        OFFSET :skip LIMIT :limit
+        LIMIT :limit OFFSET :skip
     """)
     result = await db.execute(
         stmt, {"video_id": video_id, "skip": skip, "limit": limit}
@@ -419,12 +439,8 @@ async def get_video_comments(
                 "is_spam": row.is_spam,
                 "sentiment": row.sentiment,
                 "confidence": row.confidence,
-                "summary": row.summary,
                 "is_complaint": row.is_complaint,
                 "is_praise": row.is_praise,
-                "aspects": [a.strip() for a in row.aspect_str.split(",")]
-                if row.aspect_str
-                else [],
             }
         )
     return comments
@@ -449,8 +465,6 @@ async def get_video_stats(video_id: int, db: AsyncSession = Depends(get_db)):
         {"name": row.sentiment or "neutral", "value": row.count} for row in sent_res
     ]
 
-    # Aspect Distribution removed
-    aspect_dist = []
 
     # Timeline (by day)
     time_stmt = text("""
@@ -468,24 +482,32 @@ async def get_video_stats(video_id: int, db: AsyncSession = Depends(get_db)):
     timeline = []
     for row in time_res:
         if row.date:
+            # Postgres returns date objects, SQLite returns strings.
+            date_val = row.date
+            if hasattr(date_val, "strftime"):
+                date_str = date_val.strftime("%Y-%m-%d")
+            else:
+                date_str = str(date_val)[:10]
             timeline.append(
                 {
-                    "date": row.date.strftime("%Y-%m-%d"),
+                    "date": date_str,
                     "positive": row.pos_count,
                     "negative": row.neg_count,
                     "neutral": row.neu_count,
                 }
             )
 
-    # Top Words (Simple heuristic for word cloud)
+    # Top Words: bounded sample (newest 5000) so huge videos don't OOM Python.
     words_stmt = text("""
-        SELECT c.text 
-        FROM comments c 
+        SELECT c.text
+        FROM comments c
         WHERE c.video_id = :video_id AND c.is_spam = false
+        ORDER BY c.id DESC
+        LIMIT 5000
     """)
     words_res = await db.execute(words_stmt, {"video_id": video_id})
 
-    word_counts = {}
+    word_counts: Counter[str] = Counter()
     stop_words = {
         "dan",
         "di",
@@ -541,46 +563,65 @@ async def get_video_stats(video_id: int, db: AsyncSession = Depends(get_db)):
     return {
         "total_comments": total_comments,
         "sentiment_distribution": sentiment_dist,
-        "aspect_distribution": aspect_dist,
         "timeline": timeline,
         "top_words": top_words,
     }
 
 
 @router.post("/{video_id}/chat")
+@limiter.limit("30/minute")
 async def chat_video(
-    video_id: int, request: ChatRequest, db: AsyncSession = Depends(get_db)
+    request: Request,
+    video_id: int,
+    payload: ChatRequest,
+    db: AsyncSession = Depends(get_db),
 ):
     video = await db.get(Video, video_id)
     if not video:
         raise HTTPException(status_code=404, detail="Video not found")
 
-    retrieval_service = RetrievalService(db)
-    chat_service = ChatService()
-
-    from sqlalchemy import func
-    
-    stmt_count = select(func.count(Comment.id)).where(Comment.video_id == video_id, Comment.is_spam == False)
-    total_comments = (await db.execute(stmt_count)).scalar() or 0
-    
-    # Send 25% of relevant comments to AI, but cap at 100 to prevent rate limits or context bloat
-    dynamic_limit = max(20, int(total_comments * 0.25))
-    dynamic_limit = min(dynamic_limit, 100)
-
-    retrieved_comments = await retrieval_service.search_similar_comments(
-        video_id, request.question, limit=dynamic_limit
-    )
-    answer = chat_service.ask_question(request.question, retrieved_comments)
+    question = payload.question.strip()
+    if not question:
+        raise HTTPException(status_code=400, detail="Question must not be empty.")
+    if len(question) > settings.MAX_QUESTION_LENGTH:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Question too long (max {settings.MAX_QUESTION_LENGTH} chars).",
+        )
 
     try:
-        # Gemini sometimes returns integers, strings, or even the index [1]. Let's safely match them.
-        ai_ids = [str(x) for x in answer.get("supporting_comment_ids", [])]
+        retrieval_service = RetrievalService(db)
+        chat_service = ChatService()
+    except ValueError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    stmt_count = select(func.count(Comment.id)).where(
+        Comment.video_id == video_id, Comment.is_spam.is_(False)
+    )
+    total_comments = (await db.execute(stmt_count)).scalar() or 0
+
+    # Priority: per-question override > saved video preference > server default.
+    override = payload.context_limit
+    fraction = None
+    if override is None:
+        override = video.chat_context_limit
+        fraction = video.chat_context_fraction
+    dynamic_limit = _resolve_chat_limit(total_comments, override, fraction)
+
+    retrieved_comments = await retrieval_service.search_similar_comments(
+        video_id, question, limit=dynamic_limit
+    )
+    answer = await asyncio.to_thread(chat_service.ask_question, question, retrieved_comments)
+
+    # Gemini sometimes returns integers, strings, or indices. Match safely.
+    try:
+        ai_ids = {str(x) for x in answer.get("supporting_comment_ids", [])}
         supporting_evidence = [c for c in retrieved_comments if str(c["id"]) in ai_ids]
 
-        # Fallback: if Gemini fails to map IDs, just show the top 3 retrieved comments
+        # Fallback: if Gemini fails to map IDs, show the top 3 retrieved comments
         if not supporting_evidence and retrieved_comments:
             supporting_evidence = retrieved_comments[:3]
-    except:
+    except Exception:  # noqa: BLE001
         supporting_evidence = retrieved_comments[:3]
 
     return {
@@ -588,22 +629,8 @@ async def chat_video(
         "confidence": answer.get("confidence"),
         "relevant_aspects": answer.get("relevant_aspects"),
         "evidence": supporting_evidence,
-    }
-
-
-@router.get("/{video_id}/report")
-async def get_video_report(video_id: int, db: AsyncSession = Depends(get_db)):
-    stmt = select(VideoReport).where(VideoReport.video_id == video_id)
-    report = (await db.execute(stmt)).scalar_one_or_none()
-    if not report:
-        return {"status": "not_ready"}
-
-    return {
-        "status": "ready",
-        "overall_sentiment": report.overall_sentiment,
-        "summary": report.summary,
-        "top_complaints": report.top_complaints,
-        "top_praises": report.top_praises,
+        "context_used": len(retrieved_comments),
+        "context_limit": dynamic_limit,
     }
 
 
@@ -623,33 +650,71 @@ async def export_video_comments(video_id: int, db: AsyncSession = Depends(get_db
     """)
     result = await db.execute(stmt, {"video_id": video_id})
 
-    output = io.StringIO()
-    writer = csv.writer(output)
-    writer.writerow(
-        ["Author", "Comment", "Likes", "Is Spam", "Sentiment", "Confidence Score"]
-    )
-
-    for row in result:
-        conf_str = (
-            f"{row.confidence * 100:.2f}%" if row.confidence is not None else "N/A"
-        )
+    def generate():
+        output = io.StringIO()
+        writer = csv.writer(output)
         writer.writerow(
-            [
-                row.author_name,
-                row.text,
-                row.like_count,
-                "Yes" if row.is_spam else "No",
-                row.sentiment,
-                conf_str,
-            ]
+            ["Author", "Comment", "Likes", "Is Spam", "Sentiment", "Confidence Score"]
         )
-
-    output.seek(0)
+        yield output.getvalue()
+        output.seek(0)
+        output.truncate(0)
+        for row in result:
+            conf_str = (
+                f"{row.confidence * 100:.2f}%" if row.confidence is not None else "N/A"
+            )
+            writer.writerow(
+                [
+                    row.author_name,
+                    row.text,
+                    row.like_count,
+                    "Yes" if row.is_spam else "No",
+                    row.sentiment,
+                    conf_str,
+                ]
+            )
+            yield output.getvalue()
+            output.seek(0)
+            output.truncate(0)
 
     return StreamingResponse(
-        iter([output.getvalue()]),
+        generate(),
         media_type="text/csv",
         headers={
             "Content-Disposition": f"attachment; filename=echolens_export_{video_id}.csv"
         },
     )
+
+
+class VideoSettingsRequest(BaseModel):
+    chat_context_limit: int | None = Field(default=None, ge=5, le=100)
+    chat_context_fraction: float | None = Field(default=None, ge=0.05, le=1.0)
+
+
+@router.patch("/{video_id}/settings")
+async def update_video_settings(
+    video_id: int, payload: VideoSettingsRequest, db: AsyncSession = Depends(get_db)
+):
+    """User-adjustable per-video limits (chat context). Clamped server-side."""
+    video = await db.get(Video, video_id)
+    if not video:
+        raise HTTPException(status_code=404, detail="Video not found")
+    if payload.chat_context_limit is not None:
+        video.chat_context_limit = max(
+            5, min(payload.chat_context_limit, settings.MAX_CHAT_CONTEXT)
+        )
+    if payload.chat_context_fraction is not None:
+        video.chat_context_fraction = max(
+            0.05, min(payload.chat_context_fraction, 1.0)
+        )
+    await db.commit()
+    return {
+        "video_id": video.id,
+        "chat_context_limit": video.chat_context_limit,
+        "chat_context_fraction": video.chat_context_fraction,
+        "server_caps": {
+            "max_chat_context": settings.MAX_CHAT_CONTEXT,
+            "max_comment_page_size": settings.MAX_COMMENT_PAGE_SIZE,
+            "max_process_limit": settings.MAX_PROCESS_LIMIT,
+        },
+    }

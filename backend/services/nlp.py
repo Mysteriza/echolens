@@ -1,25 +1,32 @@
+import logging
 import os
+import threading
 
 import torch
 from transformers import pipeline
+
+logger = logging.getLogger(__name__)
 
 # Aspect Categories removed as Zero-Shot is disabled
 
 
 class IndoBERTService:
     _instance = None
+    _lock = threading.Lock()
 
     def __new__(cls):
         if cls._instance is None:
-            cls._instance = super().__new__(cls)
-            cls._instance.initialized = False
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = super().__new__(cls)
+                    cls._instance.initialized = False
         return cls._instance
 
     def __init__(self):
         if self.initialized:
             return
 
-        print("Detecting Hardware for IndoBERT...")
+        logger.info("Detecting Hardware for IndoBERT...")
         self.device_id = -1  # CPU fallback
         self.batch_size = 16
 
@@ -30,14 +37,14 @@ class IndoBERTService:
                 self.batch_size = 100
             else:
                 self.batch_size = 50
-            print(
-                f"Hardware: NVIDIA GPU (CUDA) detected. Batch Size: {self.batch_size}"
+            logger.info(
+                "Hardware: NVIDIA GPU (CUDA) detected. Batch Size: %d", self.batch_size
             )
         elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
             self.device_id = "mps"
             self.batch_size = 50
-            print(
-                f"Hardware: Apple Silicon (MPS) detected. Batch Size: {self.batch_size}"
+            logger.info(
+                "Hardware: Apple Silicon (MPS) detected. Batch Size: %d", self.batch_size
             )
         else:
             cores = os.cpu_count() or 4
@@ -47,8 +54,8 @@ class IndoBERTService:
                 self.batch_size = 50
             else:
                 self.batch_size = 16
-            print(
-                f"Hardware: CPU detected ({cores} Cores). Batch Size: {self.batch_size}"
+            logger.info(
+                "Hardware: CPU detected (%d Cores). Batch Size: %d", cores, self.batch_size
             )
 
         self.initialized = True
@@ -56,56 +63,49 @@ class IndoBERTService:
     def load_indobert(self):
         if hasattr(self, "classifier"):
             return
-            
-        print("Loading IndoBERT Model... (This may take a moment)")
-        model_name = "w11wo/indonesian-roberta-base-sentiment-classifier"
 
-        if self.device_id == -1:
-            from transformers import AutoModelForSequenceClassification, AutoTokenizer
-            import torch
-            
-            print("Applying Dynamic Quantization (INT8) for faster CPU inference...")
-            tokenizer = AutoTokenizer.from_pretrained(model_name)
-            model = AutoModelForSequenceClassification.from_pretrained(model_name)
-            
-            # Compress Linear layers to INT8 for ~2x speedup on CPU
-            quantized_model = torch.quantization.quantize_dynamic(
-                model, {torch.nn.Linear}, dtype=torch.qint8
-            )
-            
-            self.classifier = pipeline(
-                "sentiment-analysis",
-                model=quantized_model,
-                tokenizer=tokenizer,
-                device=-1,
-                truncation=True,
-                max_length=512,
-            )
-        else:
-            self.classifier = pipeline(
-                "sentiment-analysis",
-                model=model_name,
-                device=self.device_id,
-                truncation=True,
-                max_length=512,
-            )
-        print("IndoBERT Model Loaded Successfully!")
+        with IndoBERTService._lock:
+            if hasattr(self, "classifier"):
+                return
+            logger.info("Loading IndoBERT Model... (This may take a moment)")
+            model_name = "w11wo/indonesian-roberta-base-sentiment-classifier"
 
+            if self.device_id == -1:
+                from transformers import (
+                    AutoModelForSequenceClassification,
+                    AutoTokenizer,
+                )
 
+                logger.info(
+                    "Applying Dynamic Quantization (INT8) for faster CPU inference..."
+                )
+                tokenizer = AutoTokenizer.from_pretrained(model_name)
+                model = AutoModelForSequenceClassification.from_pretrained(model_name)
 
-    def analyze_sentiment(self, text: str) -> dict:
-        try:
-            result = self.classifier(text)
-            if result and len(result) > 0:
-                prediction = result[0]
-                return {
-                    "sentiment": prediction["label"],
-                    "confidence": prediction["score"],
-                }
-            return {"sentiment": "neutral", "confidence": 0.0}
-        except Exception as e:
-            print(f"Error in IndoBERT classification: {e}")
-            return {"sentiment": "neutral", "confidence": 0.0}
+                # Compress Linear layers to INT8 for ~2x speedup on CPU
+                quantized_model = torch.quantization.quantize_dynamic(
+                    model, {torch.nn.Linear}, dtype=torch.qint8
+                )
+
+                self.classifier = pipeline(
+                    "sentiment-analysis",
+                    model=quantized_model,
+                    tokenizer=tokenizer,
+                    device=-1,
+                    truncation=True,
+                    max_length=512,
+                )
+            else:
+                self.classifier = pipeline(
+                    "sentiment-analysis",
+                    model=model_name,
+                    device=self.device_id,
+                    truncation=True,
+                    max_length=512,
+                )
+            # Serialize inference: transformers pipelines are not thread-safe.
+            self._infer_lock = threading.Lock()
+            logger.info("IndoBERT Model Loaded Successfully!")
 
     def analyze_sentiments_batch(self, texts: list[str]) -> list[dict]:
         """
@@ -115,11 +115,12 @@ class IndoBERTService:
             return []
 
         try:
-            results = self.classifier(texts, batch_size=self.batch_size)
+            with self._infer_lock:
+                results = self.classifier(texts, batch_size=self.batch_size)
             output = []
             for pred in results:
                 output.append({"sentiment": pred["label"], "confidence": pred["score"]})
             return output
-        except Exception as e:
-            print(f"Error in IndoBERT batch classification: {e}")
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Error in IndoBERT batch classification: %s", exc)
             return [{"sentiment": "neutral", "confidence": 0.0} for _ in texts]
