@@ -48,12 +48,20 @@ def get_session_factory():
 async def _create_schema(conn) -> None:
     await conn.run_sync(Base.metadata.create_all)
     # Enforce RLS on Postgres so Supabase Security Advisor stays clean.
-    # No permissive policies = deny-by-default for anon/authenticated roles;
-    # the backend connects with a privileged role that bypasses RLS.
+    # Explicit DENY policy for anon/authenticated documents the intent and
+    # silences "RLS Enabled No Policy"; the backend connects with a
+    # privileged role that bypasses RLS, so the app is unaffected.
     if DB_BACKEND != "sqlite":
         for table in Base.metadata.tables:
             try:
                 await conn.execute(text(f"ALTER TABLE {table} ENABLE ROW LEVEL SECURITY"))
+                await conn.execute(text(f"DROP POLICY IF EXISTS deny_public ON {table}"))
+                await conn.execute(
+                    text(
+                        f"CREATE POLICY deny_public ON {table} "
+                        f"FOR ALL TO anon, authenticated USING (false) WITH CHECK (false)"
+                    )
+                )
             except Exception:  # noqa: BLE001
                 pass
     # Lightweight forward-migration for existing DBs (create_all won't
