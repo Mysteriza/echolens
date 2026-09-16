@@ -65,6 +65,31 @@ async def _create_schema(conn) -> None:
             except Exception:  # noqa: BLE001
                 pass
     # Lightweight forward-migration for existing DBs (create_all won't
+    # ALTER tables or backfill indexes). Covering FK indexes silence the
+    # "Unindexed foreign keys" advisor item; dropping the write-only
+    # parent_id index silences "Unused Index".
+    try:
+        if DB_BACKEND == "sqlite":
+            await conn.execute(
+                text("CREATE INDEX IF NOT EXISTS ix_comments_video_id ON comments (video_id)")
+            )
+            await conn.execute(
+                text("CREATE INDEX IF NOT EXISTS ix_video_logs_video_id ON video_logs (video_id)")
+            )
+            await conn.execute(text("DROP INDEX IF EXISTS ix_comments_parent_id"))
+            await conn.execute(text("DROP INDEX IF EXISTS ix_video_logs_id"))
+        else:
+            await conn.execute(
+                text("CREATE INDEX IF NOT EXISTS ix_comments_video_id ON comments (video_id)")
+            )
+            await conn.execute(
+                text("CREATE INDEX IF NOT EXISTS ix_video_logs_video_id ON video_logs (video_id)")
+            )
+            await conn.execute(text("DROP INDEX IF EXISTS ix_comments_parent_id"))
+            await conn.execute(text("DROP INDEX IF EXISTS ix_video_logs_id"))
+    except Exception:  # noqa: BLE001
+        pass
+    # Lightweight forward-migration for existing DBs (create_all won't
     # ALTER tables). New nullable columns for per-video chat preferences.
     # SQLite lacks IF NOT EXISTS for ADD COLUMN on old versions — probe first.
     try:

@@ -42,8 +42,8 @@ class Comment(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     youtube_id = Column(String, unique=True, index=True, nullable=False)
-    video_id = Column(Integer, ForeignKey("videos.id"), nullable=False)
-    parent_id = Column(String, index=True)  # youtube_id of the parent comment
+    video_id = Column(Integer, ForeignKey("videos.id"), nullable=False, index=True)
+    parent_id = Column(String)  # youtube_id of the parent comment (write-only, no index)
     author_name = Column(String)
     text = Column(String, nullable=False)
     published_at = Column(DateTime(timezone=True))
@@ -83,7 +83,7 @@ class CommentAnalysis(Base):
 class VideoLog(Base):
     __tablename__ = "video_logs"
 
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(Integer, primary_key=True)
     video_id = Column(Integer, ForeignKey("videos.id", ondelete="CASCADE"), index=True)
     message = Column(Text, nullable=False)
     level = Column(String(50), default="INFO")
